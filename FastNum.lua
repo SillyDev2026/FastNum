@@ -1,11 +1,18 @@
---!native
 --!optimize 2
+--!native
+--!nocheck
+
+-- FastME v2.9.1: direct scientific parsing plus v2.9.0 native kernels.
+-- Value = {mantissa, exponent}; normalize externally constructed values first.
+-- Raw pair APIs return two numbers; they do not allocate result tables.
+-- Arithmetic expects normalized inputs and finite integer decimal exponents.
+-- Existing allocating APIs always return independent result tables.
 
 local FastME = {}
 export type Value = {number}
 
-FastME.VERSION = "2.8.0"
-FastME.BUILD = "slowpath-rebuild-20260924-a"
+FastME.VERSION = "2.9.1"
+FastME.BUILD = "scientific-parser-20260928-a"
 
 local abs = math.abs
 local floor = math.floor
@@ -23,7 +30,6 @@ local huge = math.huge
 
 local tonumber = tonumber
 local tostring = tostring
-local strFind = string.find
 local strSub = string.sub
 local strFormat = string.format
 local strByte = string.byte
@@ -58,6 +64,9 @@ local POW10_NEG = {
 	1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17,
 }
 
+local POW10_SCALE = table.create(617)
+for exponent = -308, 308 do POW10_SCALE[exponent + 309] = 10 ^ exponent end
+
 local function isSpaceByte(c: number): boolean
 	return c == 32 or (c >= 9 and c <= 13)
 end
@@ -83,7 +92,7 @@ local function normalizeRaw(m: number, e: number): (number, number)
 	elseif shift < 0 and shift >= -17 then
 		m = m * POW10_POS[-shift]
 	else
-		m = m / (10 ^ shift)
+		m = m / POW10_SCALE[shift + 309]
 	end
 	e = e + shift
 	a = abs(m)
@@ -124,7 +133,7 @@ local function fromNumberRaw(x: number): (number, number)
 	elseif e < 0 and e >= -17 then
 		m = x * POW10_POS[-e]
 	else
-		m = x / (10 ^ e)
+		m = x / POW10_SCALE[e + 309]
 	end
 	local ma = abs(m)
 	if ma >= 10 then return m * 0.1, e + 1 end
@@ -171,7 +180,7 @@ local function toNumberRaw(m: number, e: number): number
 		local extra = -e - 308
 		return (m * 1e-308) * POW10_NEG[extra]
 	end
-	return m * (10 ^ e)
+	return m * (POW10_SCALE[e + 309] or (10 ^ e))
 end
 
 local function manualStringRaw(s: string): (number, number)
@@ -274,9 +283,82 @@ local function finishScientificRaw(left: number, exponent: number): (number, num
 	return m, e + exponent
 end
 
--- v2.5.1 byte-scan parser. It uses tonumber for the common path,
--- then string.byte for overflow/underflow exponent detection without string.find.
+-- The original parser remains the compatibility fallback.
+-- A normalized scientific fast path runs before full-number conversion.
+-- Normalized scientific values with large decimal exponents.
+-- The <=15-significant-digit branch uses exact integer accumulation and one
+-- binary64 division. Longer mantissas retain tonumber's rounding.
+-- i is an e/E delimiter found by the caller; exponent digits are validated below.
+local function scientificStringRaw(s: string, i: number): (number?, number)
+	local n = #s
+	local cursor = i + 1
+	local c = strByte(s, cursor)
+	local negativeExponent = c == 45
+	if negativeExponent or c == 43 then cursor = cursor + 1 end
+	local exponent = 0
+	for position = cursor, n do
+		local digit = strByte(s, position) - 48
+		if digit < 0 or digit > 9 then return nil, 0 end
+		exponent = exponent * 10 + digit
+	end
+	if exponent >= 309 then
+		local p = 1
+		local first = strByte(s, p)
+		local negative = first == 45
+		if negative or first == 43 then p = p + 1; first = strByte(s, p) end
+		-- Canonical scientific mantissa: one nonzero digit, optional decimal fraction.
+		-- This excludes hexadecimal and nested exponent syntax before conversion.
+		if first >= 49 and first <= 57 then
+			local significand = first - 48
+			local digits = 1
+			p = p + 1
+			if p < i and strByte(s, p) == 46 then
+				p = p + 1
+				while p < i do
+					local digit = strByte(s, p) - 48
+					if digit < 0 or digit > 9 then break end
+					significand = significand * 10 + digit
+					digits = digits + 1
+					p = p + 1
+				end
+			end
+			if p == i then
+				local m
+				if digits == 1 then m = significand
+				elseif digits <= 15 then m = significand / POW10_POS[digits - 1]
+				else m = tonumber(strSub(s, 1, i - 1)); negative = false end
+				if negative then m = -m end
+				if negativeExponent then exponent = -exponent end
+				if m >= 10 or m <= -10 then m = m * 0.1; exponent = exponent + 1 end
+				return m, exponent
+			end
+		end
+	end
+	return nil, 0
+end
+
 local function fromStringRaw(s: string): (number, number)
+	do
+		local n = #s
+		local candidate = 0
+		if n >= 6 then
+			local c = strByte(s, n - 4)
+			if c == 101 or c == 69 then
+				candidate = n - 4
+			else
+				c = strByte(s, n - 5)
+				candidate = (c == 101 or c == 69) and (n - 5) or 0
+				if candidate == 0 and (c == 45 or c == 43) and n >= 7 then
+					c = strByte(s, n - 6)
+					candidate = (c == 101 or c == 69) and (n - 6) or 0
+				end
+			end
+		end
+		if candidate > 0 then
+			local m, e = scientificStringRaw(s, candidate)
+			if m ~= nil then return m, e end
+		end
+	end
 	local x = tonumber(s)
 	if x ~= nil then
 		if x ~= POS_INF and x ~= NEG_INF then
@@ -285,7 +367,7 @@ local function fromStringRaw(s: string): (number, number)
 			end
 		end
 
-		-- Byte scan replaces string.find in the overflow/underflow path.
+		-- Byte scan handles overflow/underflow exponent detection directly.
 		-- Because tonumber already accepted the full syntax, we only need to
 		-- locate e/E and determine whether a zero result had any non-zero
 		-- mantissa digit before the exponent.
@@ -364,42 +446,36 @@ local function subRaw(am: number, ae: number, bm: number, be: number): (number, 
 end
 
 local function mulRaw(am: number, ae: number, bm: number, be: number): (number, number)
-	if am ~= am or bm ~= bm then return NAN, 0 end
-	if am == 0 or bm == 0 then
-		if am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return NAN, 0 end
-		return 0, 0
-	end
-	if am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return am * bm, 0 end
 	local m = am * bm
+	local magnitude = abs(m)
+	-- IEEE multiplication resolves NaN, infinity and zero-times-infinity.
+	if not (magnitude < POS_INF) then return m, 0 end
+	if m == 0 then return 0, 0 end
 	local e = ae + be
-	if m >= 10 or m <= -10 then return m * 0.1, e + 1 end
-	if m > -1 and m < 1 then return m * 10, e - 1 end
+	if magnitude >= 10 then return m * 0.1, e + 1 end
+	if magnitude < 1 then return m * 10, e - 1 end
 	return m, e
 end
 
 local function divRaw(am: number, ae: number, bm: number, be: number): (number, number)
-	if am ~= am or bm ~= bm then return NAN, 0 end
 	if bm == 0 then
-		if am == 0 then return NAN, 0 end
+		if am == 0 or am ~= am then return NAN, 0 end
 		return am > 0 and POS_INF or NEG_INF, 0
 	end
-	if am == 0 then return 0, 0 end
-	local aInf = am == POS_INF or am == NEG_INF
-	local bInf = bm == POS_INF or bm == NEG_INF
-	if aInf and bInf then return NAN, 0 end
-	if aInf then return am * (bm > 0 and 1 or -1), 0 end
-	if bInf then return 0, 0 end
 	local m = am / bm
+	local magnitude = abs(m)
+	if not (magnitude < POS_INF) then return m, 0 end
+	if m == 0 then return 0, 0 end
 	local e = ae - be
-	if m > -1 and m < 1 then return m * 10, e - 1 end
-	if m >= 10 or m <= -10 then return m * 0.1, e + 1 end
+	if magnitude < 1 then return m * 10, e - 1 end
+	if magnitude >= 10 then return m * 0.1, e + 1 end
 	return m, e
 end
 
 local function scaleRaw(m: number, e: number, x: number): (number, number)
 	if m ~= m or x ~= x then return NAN, 0 end
 	if m == 0 or x == 0 then
-		if m == POS_INF or m == NEG_INF then return NAN, 0 end
+		if m == POS_INF or m == NEG_INF or x == POS_INF or x == NEG_INF then return NAN, 0 end
 		return 0, 0
 	end
 	if m == POS_INF or m == NEG_INF then return m * (x > 0 and 1 or -1), 0 end
@@ -450,10 +526,9 @@ local function recipRaw(m: number, e: number): (number, number)
 end
 
 local function squareRaw(m: number, e: number): (number, number)
-	if m ~= m then return NAN, 0 end
-	if m == 0 then return 0, 0 end
-	if m == POS_INF or m == NEG_INF then return POS_INF, 0 end
 	local r = m * m
+	if not (r < POS_INF) then return r, 0 end
+	if r == 0 then return 0, 0 end
 	local re = e + e
 	if r >= 10 then return r * 0.1, re + 1 end
 	return r, re
@@ -651,7 +726,7 @@ function FastME.fromNumber(x: number): Value
 			elseif shift < 0 and shift >= -17 then
 				m = m * POW10_POS[-shift]
 			else
-				m = m / (10 ^ shift)
+				m = m / POW10_SCALE[shift + 309]
 			end
 			e = e + shift
 			ma = abs(m)
@@ -668,7 +743,7 @@ function FastME.fromNumber(x: number): Value
 	elseif e < 0 and e >= -17 then
 		m = x * POW10_POS[-e]
 	else
-		m = x / (10 ^ e)
+		m = x / POW10_SCALE[e + 309]
 	end
 	local ma = abs(m)
 	if ma >= 10 then return {m * 0.1, e + 1} end
@@ -677,197 +752,184 @@ function FastME.fromNumber(x: number): Value
 end
 
 function FastME.fromString(s: string): Value
-	local x = tonumber(s)
-	if x ~= nil then
-		if x ~= POS_INF and x ~= NEG_INF then
-			if x >= 1e-308 or x <= -1e-308 then
-				if x == 0 then return {0, 0} end
-				local a = abs(x)
-				if a >= 1 then
-					if a < 10 then return {x, 0} end
-					if a < 100 then return {x * 0.1, 1} end
-					if a < 1e3 then return {x * 1e-2, 2} end
-					if a < 1e4 then return {x * 1e-3, 3} end
-					if a < 1e5 then return {x * 1e-4, 4} end
-					if a < 1e6 then return {x * 1e-5, 5} end
-					if a < 1e7 then return {x * 1e-6, 6} end
-				else
-					if a >= 1e-1 then return {x * 10, -1} end
-					if a >= 1e-2 then return {x * 1e2, -2} end
-					if a >= 1e-3 then return {x * 1e3, -3} end
-					if a >= 1e-4 then return {x * 1e4, -4} end
-					if a >= 1e-5 then return {x * 1e5, -5} end
-					if a >= 1e-6 then return {x * 1e6, -6} end
-					if a >= 1e-7 then return {x * 1e7, -7} end
-				end
-				local e = floor(log10(a))
-				local m
-				if e > 0 and e <= 17 then
-					m = x * POW10_NEG[e]
-				elseif e < 0 and e >= -17 then
-					m = x * POW10_POS[-e]
-				else
-					m = x / (10 ^ e)
-				end
-				local ma = abs(m)
-				if ma >= 10 then return {m * 0.1, e + 1} end
-				if ma < 1 then return {m * 10, e - 1} end
-				return {m, e}
-			end
-		end
-
-		local ePos
-		local hasNonZeroMantissa = x ~= 0
-		local scanIndex = 1
-		local scanLength = #s
-		while scanIndex <= scanLength do
-			local byte = strByte(s, scanIndex)
-			if byte == 101 or byte == 69 then
-				ePos = scanIndex
-				break
-			end
-			if not hasNonZeroMantissa and byte >= 49 and byte <= 57 then
-				hasNonZeroMantissa = true
-			end
-			scanIndex = scanIndex + 1
-		end
-		if x == 0 and not hasNonZeroMantissa then return {0, 0} end
-
-		if ePos then
-			local left = tonumber(strSub(s, 1, ePos - 1))
-			local exponent = tonumber(strSub(s, ePos + 1))
-			if left ~= nil and exponent ~= nil and left ~= POS_INF and left ~= NEG_INF and exponent % 1 == 0 then
-				if left == 0 then return {0, 0} end
-				local a = abs(left)
-				if a >= 1 and a < 10 then return {left, exponent} end
-				if a >= 10 and a < 100 then return {left * 0.1, exponent + 1} end
-				if a >= 0.1 and a < 1 then return {left * 10, exponent - 1} end
-				local e = floor(log10(a))
-				local m
-				if e > 0 and e <= 17 then
-					m = left * POW10_NEG[e]
-				elseif e < 0 and e >= -17 then
-					m = left * POW10_POS[-e]
-				else
-					m = left / (10 ^ e)
-				end
-				local ma = abs(m)
-				if ma >= 10 then m, e = m * 0.1, e + 1 elseif ma < 1 then m, e = m * 10, e - 1 end
-				return {m, e + exponent}
-			end
-		end
+	local n = #s
+	if n == 0 then
+		return {NAN, 0}
 	end
 
-	local n = #s
-	if n == 0 then return {NAN, 0} end
 	local i = 1
-	while i <= n and isSpaceByte(strByte(s, i)) do i = i + 1 end
-	if i > n then return {NAN, 0} end
-
+	local c = strByte(s, 1)
 	local sign = 1
-	local c = strByte(s, i)
+
 	if c == 45 then
 		sign = -1
-		i = i + 1
+		i = 2
 	elseif c == 43 then
-		i = i + 1
+		i = 2
 	end
+
+	if i > n then
+		return {NAN, 0}
+	end
+
+	local sig = 0
+	local sigCount = 0
 
 	local digitIndex = 0
 	local intDigits = 0
-	local sawDot = false
-	local sawDigit = false
 	local firstIndex = 0
-	local sig = 0
-	local sigCount = 0
-	local expMode = false
-	local expSign = 1
-	local expValue = 0
-	local expDigits = 0
-	local expSignAllowed = true
+
+	local sawDot = false
+	local exponentFound = false
 
 	while i <= n do
 		c = strByte(s, i)
-		if isSpaceByte(c) then
-			i = i + 1
-		elseif not expMode then
-			if c >= 48 and c <= 57 then
-				sawDigit = true
-				digitIndex = digitIndex + 1
-				if not sawDot then intDigits = intDigits + 1 end
-				local d = c - 48
-				if firstIndex == 0 then
-					if d ~= 0 then
-						firstIndex = digitIndex
-						sig = d
-						sigCount = 1
-					end
-				elseif sigCount < 17 then
-					sig = sig * 10 + d
-					sigCount = sigCount + 1
+
+		if c >= 48 and c <= 57 then
+			local d = c - 48
+
+			digitIndex = digitIndex + 1
+			if not sawDot then
+				intDigits = intDigits + 1
+			end
+
+			if firstIndex == 0 then
+				if d ~= 0 then
+					firstIndex = digitIndex
+					sig = d
+					sigCount = 1
 				end
-				i = i + 1
-			elseif c == 46 then
-				if sawDot then return {NAN, 0} end
-				sawDot = true
-				i = i + 1
-			elseif c == 101 or c == 69 then
-				if not sawDigit then return {NAN, 0} end
-				expMode = true
-				i = i + 1
-			else
+			elseif sigCount < 17 then
+				sig = sig * 10 + d
+				sigCount = sigCount + 1
+			end
+
+			i = i + 1
+
+		elseif c == 46 then
+			if sawDot then
 				return {NAN, 0}
 			end
+
+			sawDot = true
+			i = i + 1
+
+		elseif c == 101 or c == 69 then
+			if digitIndex == 0 then
+				return {NAN, 0}
+			end
+
+			exponentFound = true
+			i = i + 1
+			break
+
 		else
-			if expSignAllowed and (c == 43 or c == 45) then
-				if c == 45 then expSign = -1 end
-				expSignAllowed = false
-				i = i + 1
-			elseif c >= 48 and c <= 57 then
-				expSignAllowed = false
-				expDigits = expDigits + 1
-				expValue = expValue * 10 + (c - 48)
-				i = i + 1
-			else
+			local x = tonumber(s)
+
+			if x == nil then
 				return {NAN, 0}
 			end
+
+			if x == 0 then
+				return {0, 0}
+			end
+
+			if x == POS_INF or x == NEG_INF then
+				return {x, 0}
+			end
+
+			local a = abs(x)
+			local e = floor(log10(a))
+			local m
+
+			if e >= 0 and e <= 17 then
+				m = x * POW10_NEG[e]
+			elseif e < 0 and e >= -17 then
+				m = x * POW10_POS[-e]
+			else
+				m = x / POW10_SCALE[e + 309]
+			end
+
+			local ma = abs(m)
+
+			if ma >= 10 then
+				return {m * 0.1, e + 1}
+			elseif ma < 1 then
+				return {m * 10, e - 1}
+			end
+
+			return {m, e}
 		end
 	end
 
-	if not sawDigit then return {NAN, 0} end
-	if expMode and expDigits == 0 then return {NAN, 0} end
-	if firstIndex == 0 then return {0, 0} end
-
-	local m = sig
-	if sigCount > 1 then m = m / (10 ^ (sigCount - 1)) end
-	m = m * sign
-	local e = intDigits - firstIndex
-	if expMode then e = e + expSign * expValue end
-
-	if m == 0 then return {0, 0} end
-	if m ~= m then return {NAN, 0} end
-	if m == POS_INF or m == NEG_INF then return {m, 0} end
-	local ma = abs(m)
-	if ma >= 1 and ma < 10 then return {m, e} end
-	if ma >= 10 and ma < 100 then return {m * 0.1, e + 1} end
-	if ma >= 0.1 and ma < 1 then return {m * 10, e - 1} end
-	if ma < 1e-308 then
-		m = m * 1e308
-		e = e - 308
-		ma = abs(m)
+	if digitIndex == 0 then
+		return {NAN, 0}
 	end
-	local shift = floor(log10(ma))
-	if shift > 0 and shift <= 17 then
-		m = m * POW10_NEG[shift]
-	elseif shift < 0 and shift >= -17 then
-		m = m * POW10_POS[-shift]
+
+	local expValue = 0
+
+	if exponentFound then
+		if i > n then
+			return {NAN, 0}
+		end
+
+		local expSign = 1
+		c = strByte(s, i)
+
+		if c == 45 then
+			expSign = -1
+			i = i + 1
+		elseif c == 43 then
+			i = i + 1
+		end
+
+		if i > n then
+			return {NAN, 0}
+		end
+
+		local expDigits = 0
+
+		while i <= n do
+			c = strByte(s, i)
+
+			if c < 48 or c > 57 then
+				return {NAN, 0}
+			end
+
+			expValue = expValue * 10 + (c - 48)
+			expDigits = expDigits + 1
+			i = i + 1
+		end
+
+		if expDigits == 0 then
+			return {NAN, 0}
+		end
+
+		expValue = expValue * expSign
+	end
+
+	if firstIndex == 0 then
+		return {0, 0}
+	end
+
+	local m
+
+	if sigCount == 1 then
+		m = sig * sign
 	else
-		m = m / (10 ^ shift)
+		m = sig * POW10_NEG[sigCount - 1] * sign
 	end
-	e = e + shift
-	ma = abs(m)
-	if ma >= 10 then return {m * 0.1, e + 1} end
-	if ma < 1 then return {m * 10, e - 1} end
+
+	local e = intDigits - firstIndex + expValue
+
+	local ma = abs(m)
+
+	if ma >= 10 then
+		return {m * 0.1, e + 1}
+	elseif ma < 1 then
+		return {m * 10, e - 1}
+	end
+
 	return {m, e}
 end
 
@@ -885,7 +947,7 @@ function FastME.toNumber(a: Value): number
 		local extra = -e - 308
 		return (m * 1e-308) * POW10_NEG[extra]
 	end
-	return m * (10 ^ e)
+	return m * (POW10_SCALE[e + 309] or (10 ^ e))
 end
 
 function FastME.normalize(a: Value): Value
@@ -908,7 +970,7 @@ function FastME.normalize(a: Value): Value
 	elseif shift < 0 and shift >= -17 then
 		m = m * POW10_POS[-shift]
 	else
-		m = m / (10 ^ shift)
+		m = m / POW10_SCALE[shift + 309]
 	end
 	e = e + shift
 	av = abs(m)
@@ -940,7 +1002,7 @@ function FastME.add(a: Value, b: Value): Value
 	local shift = floor(log10(av))
 	if shift > 0 and shift <= 17 then m = m * POW10_NEG[shift]
 	elseif shift < 0 and shift >= -17 then m = m * POW10_POS[-shift]
-	else m = m / (10 ^ shift) end
+	else m = m / POW10_SCALE[shift + 309] end
 	ae = ae + shift
 	av = abs(m)
 	if av >= 10 then return {m * 0.1, ae + 1} end
@@ -970,7 +1032,7 @@ function FastME.sub(a: Value, b: Value): Value
 	local shift = floor(log10(av))
 	if shift > 0 and shift <= 17 then m = m * POW10_NEG[shift]
 	elseif shift < 0 and shift >= -17 then m = m * POW10_POS[-shift]
-	else m = m / (10 ^ shift) end
+	else m = m / POW10_SCALE[shift + 309] end
 	ae = ae + shift
 	av = abs(m)
 	if av >= 10 then return {m * 0.1, ae + 1} end
@@ -980,36 +1042,30 @@ end
 
 function FastME.mul(a: Value, b: Value): Value
 	local am, ae, bm, be = a[1], a[2], b[1], b[2]
-	if am ~= am or bm ~= bm then return {NAN, 0} end
-	if am == 0 or bm == 0 then
-		if am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return {NAN, 0} end
-		return {0, 0}
-	end
-	if am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return {am * bm, 0} end
 	local m = am * bm
+	local magnitude = abs(m)
+	-- IEEE multiplication resolves NaN, infinity and zero-times-infinity.
+	if not (magnitude < POS_INF) then return {m, 0} end
+	if m == 0 then return {0, 0} end
 	local e = ae + be
-	if m >= 10 or m <= -10 then return {m * 0.1, e + 1} end
-	if m > -1 and m < 1 then return {m * 10, e - 1} end
+	if magnitude >= 10 then return {m * 0.1, e + 1} end
+	if magnitude < 1 then return {m * 10, e - 1} end
 	return {m, e}
 end
 
 function FastME.div(a: Value, b: Value): Value
 	local am, ae, bm, be = a[1], a[2], b[1], b[2]
-	if am ~= am or bm ~= bm then return {NAN, 0} end
 	if bm == 0 then
-		if am == 0 then return {NAN, 0} end
+		if am == 0 or am ~= am then return {NAN, 0} end
 		return {am > 0 and POS_INF or NEG_INF, 0}
 	end
-	if am == 0 then return {0, 0} end
-	local aInf = am == POS_INF or am == NEG_INF
-	local bInf = bm == POS_INF or bm == NEG_INF
-	if aInf and bInf then return {NAN, 0} end
-	if aInf then return {am * (bm > 0 and 1 or -1), 0} end
-	if bInf then return {0, 0} end
 	local m = am / bm
+	local magnitude = abs(m)
+	if not (magnitude < POS_INF) then return {m, 0} end
+	if m == 0 then return {0, 0} end
 	local e = ae - be
-	if m > -1 and m < 1 then return {m * 10, e - 1} end
-	if m >= 10 or m <= -10 then return {m * 0.1, e + 1} end
+	if magnitude < 1 then return {m * 10, e - 1} end
+	if magnitude >= 10 then return {m * 0.1, e + 1} end
 	return {m, e}
 end
 
@@ -1025,10 +1081,9 @@ end
 
 function FastME.square(a: Value): Value
 	local m, e = a[1], a[2]
-	if m ~= m then return {NAN, 0} end
-	if m == 0 then return {0, 0} end
-	if m == POS_INF or m == NEG_INF then return {POS_INF, 0} end
 	local r = m * m
+	if not (r < POS_INF) then return {r, 0} end
+	if r == 0 then return {0, 0} end
 	local re = e + e
 	if r >= 10 then return {r * 0.1, re + 1} end
 	return {r, re}
@@ -1114,19 +1169,152 @@ FastME.root = FastME.nthRoot
 -- Scalar arithmetic
 function FastME.addNumber(a: Value, x: number): Value local m, e = fromNumberRaw(x); m, e = addRaw(a[1], a[2], m, e); return {m, e} end
 function FastME.subNumber(a: Value, x: number): Value local m, e = fromNumberRaw(x); m, e = subRaw(a[1], a[2], m, e); return {m, e} end
-function FastME.mulNumber(a: Value, x: number): Value local m, e = fromNumberRaw(x); m, e = mulRaw(a[1], a[2], m, e); return {m, e} end
-function FastME.divNumber(a: Value, x: number): Value local m, e = fromNumberRaw(x); m, e = divRaw(a[1], a[2], m, e); return {m, e} end
+-- Dedicated scalar kernels avoid converting x into a temporary mantissa/exponent pair.
+function FastME.mulNumber(a: Value, x: number): Value
+	local m, e = a[1], a[2]
+	if m ~= m or x ~= x then return {NAN, 0} end
+	if m == 0 or x == 0 then
+		if m == POS_INF or m == NEG_INF or x == POS_INF or x == NEG_INF then return {NAN, 0} end
+		return {0, 0}
+	end
+	if m == POS_INF or m == NEG_INF then return {m * (x > 0 and 1 or -1), 0} end
+	if x == POS_INF or x == NEG_INF then return {m * x, 0} end
+	local ax = x < 0 and -x or x
+	local am = m < 0 and -m or m
+	if am >= 1 and am < 10 and ax >= 0.1 and ax < 10 then
+		local r = m * x
+		if r >= 10 or r <= -10 then return {r * 0.1, e + 1} end
+		if r > -1 and r < 1 then return {r * 10, e - 1} end
+		return {r, e}
+	end
+	local xm, xe = fromNumberRaw(x)
+	local rm, re = mulRaw(m, e, xm, xe); return {rm, re}
+end
+function FastME.divNumber(a: Value, x: number): Value
+	local m, e = a[1], a[2]
+	if m ~= m or x ~= x then return {NAN, 0} end
+	if x == 0 then
+		if m == 0 then return {NAN, 0} end
+		return {m > 0 and POS_INF or NEG_INF, 0}
+	end
+	if m == 0 then return {0, 0} end
+	if m == POS_INF or m == NEG_INF then
+		if x == POS_INF or x == NEG_INF then return {NAN, 0} end
+		return {m * (x > 0 and 1 or -1), 0}
+	end
+	if x == POS_INF or x == NEG_INF then return {0, 0} end
+	local ax = x < 0 and -x or x
+	local am = m < 0 and -m or m
+	if am >= 1 and am < 10 and ax >= 0.1 and ax < 10 then
+		local r = m / x
+		if r >= 10 or r <= -10 then return {r * 0.1, e + 1} end
+		if r > -1 and r < 1 then return {r * 10, e - 1} end
+		return {r, e}
+	end
+	local xm, xe = fromNumberRaw(x)
+	local rm, re = divRaw(m, e, xm, xe); return {rm, re}
+end
 function FastME.scale10(a: Value, amount: number): Value if a[1] == 0 then return {0, 0} end; return {a[1], a[2] + amount} end
 
 -- Comparison / predicates
-function FastME.compare(a: Value, b: Value): number return compareRaw(a[1], a[2], b[1], b[2]) end
+function FastME.compare(a: Value, b: Value): number
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if am ~= am or bm ~= bm then return 0 end
+	if am == bm and ae == be then return 0 end
+	if am == POS_INF then return 1 end
+	if bm == POS_INF then return -1 end
+	if am == NEG_INF then return -1 end
+	if bm == NEG_INF then return 1 end
+	if am < 0 and bm >= 0 then return -1 end
+	if am >= 0 and bm < 0 then return 1 end
+	if am == 0 then return bm > 0 and -1 or 1 end
+	if bm == 0 then return am > 0 and 1 or -1 end
+	if am > 0 then
+		if ae ~= be then return ae < be and -1 or 1 end
+		return am < bm and -1 or 1
+	end
+	if ae ~= be then return ae < be and 1 or -1 end
+	return am < bm and -1 or 1
+end
 function FastME.compareAbs(a: Value, b: Value): number return compareAbsRaw(a[1], a[2], b[1], b[2]) end
 function FastME.eq(a: Value, b: Value): boolean return a[1] == b[1] and a[2] == b[2] end
 function FastME.neq(a: Value, b: Value): boolean return a[1] ~= b[1] or a[2] ~= b[2] end
-function FastME.lt(a: Value, b: Value): boolean return compareRaw(a[1], a[2], b[1], b[2]) < 0 end
-function FastME.lte(a: Value, b: Value): boolean return compareRaw(a[1], a[2], b[1], b[2]) <= 0 end
-function FastME.gt(a: Value, b: Value): boolean return compareRaw(a[1], a[2], b[1], b[2]) > 0 end
-function FastME.gte(a: Value, b: Value): boolean return compareRaw(a[1], a[2], b[1], b[2]) >= 0 end
+function FastME.lt(a: Value, b: Value): boolean
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if am ~= am or bm ~= bm then return (0) < 0 end
+	if am == bm and ae == be then return (0) < 0 end
+	if am == POS_INF then return (1) < 0 end
+	if bm == POS_INF then return (-1) < 0 end
+	if am == NEG_INF then return (-1) < 0 end
+	if bm == NEG_INF then return (1) < 0 end
+	if am < 0 and bm >= 0 then return (-1) < 0 end
+	if am >= 0 and bm < 0 then return (1) < 0 end
+	if am == 0 then return (bm > 0 and -1 or 1) < 0 end
+	if bm == 0 then return (am > 0 and 1 or -1) < 0 end
+	if am > 0 then
+		if ae ~= be then return (ae < be and -1 or 1) < 0 end
+		return (am < bm and -1 or 1) < 0
+	end
+	if ae ~= be then return (ae < be and 1 or -1) < 0 end
+	return (am < bm and -1 or 1) < 0
+end
+function FastME.lte(a: Value, b: Value): boolean
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if am ~= am or bm ~= bm then return (0) <= 0 end
+	if am == bm and ae == be then return (0) <= 0 end
+	if am == POS_INF then return (1) <= 0 end
+	if bm == POS_INF then return (-1) <= 0 end
+	if am == NEG_INF then return (-1) <= 0 end
+	if bm == NEG_INF then return (1) <= 0 end
+	if am < 0 and bm >= 0 then return (-1) <= 0 end
+	if am >= 0 and bm < 0 then return (1) <= 0 end
+	if am == 0 then return (bm > 0 and -1 or 1) <= 0 end
+	if bm == 0 then return (am > 0 and 1 or -1) <= 0 end
+	if am > 0 then
+		if ae ~= be then return (ae < be and -1 or 1) <= 0 end
+		return (am < bm and -1 or 1) <= 0
+	end
+	if ae ~= be then return (ae < be and 1 or -1) <= 0 end
+	return (am < bm and -1 or 1) <= 0
+end
+function FastME.gt(a: Value, b: Value): boolean
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if am ~= am or bm ~= bm then return (0) > 0 end
+	if am == bm and ae == be then return (0) > 0 end
+	if am == POS_INF then return (1) > 0 end
+	if bm == POS_INF then return (-1) > 0 end
+	if am == NEG_INF then return (-1) > 0 end
+	if bm == NEG_INF then return (1) > 0 end
+	if am < 0 and bm >= 0 then return (-1) > 0 end
+	if am >= 0 and bm < 0 then return (1) > 0 end
+	if am == 0 then return (bm > 0 and -1 or 1) > 0 end
+	if bm == 0 then return (am > 0 and 1 or -1) > 0 end
+	if am > 0 then
+		if ae ~= be then return (ae < be and -1 or 1) > 0 end
+		return (am < bm and -1 or 1) > 0
+	end
+	if ae ~= be then return (ae < be and 1 or -1) > 0 end
+	return (am < bm and -1 or 1) > 0
+end
+function FastME.gte(a: Value, b: Value): boolean
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if am ~= am or bm ~= bm then return (0) >= 0 end
+	if am == bm and ae == be then return (0) >= 0 end
+	if am == POS_INF then return (1) >= 0 end
+	if bm == POS_INF then return (-1) >= 0 end
+	if am == NEG_INF then return (-1) >= 0 end
+	if bm == NEG_INF then return (1) >= 0 end
+	if am < 0 and bm >= 0 then return (-1) >= 0 end
+	if am >= 0 and bm < 0 then return (1) >= 0 end
+	if am == 0 then return (bm > 0 and -1 or 1) >= 0 end
+	if bm == 0 then return (am > 0 and 1 or -1) >= 0 end
+	if am > 0 then
+		if ae ~= be then return (ae < be and -1 or 1) >= 0 end
+		return (am < bm and -1 or 1) >= 0
+	end
+	if ae ~= be then return (ae < be and 1 or -1) >= 0 end
+	return (am < bm and -1 or 1) >= 0
+end
 function FastME.isZero(a: Value): boolean return a[1] == 0 end
 function FastME.isOne(a: Value): boolean return a[1] == 1 and a[2] == 0 end
 function FastME.isNaN(a: Value): boolean return a[1] ~= a[1] or a[2] ~= a[2] end
@@ -1180,7 +1368,16 @@ function FastME.log10(a: Value): number if a[1] <= 0 then return NAN end; return
 function FastME.ln(a: Value): number if a[1] <= 0 then return NAN end; return (log10(a[1]) + a[2]) * LN10 end
 function FastME.log2(a: Value): number if a[1] <= 0 then return NAN end; return (log10(a[1]) + a[2]) * LOG2_10 end
 function FastME.log(a: Value, base: number): number if a[1] <= 0 or base <= 0 or base == 1 then return NAN end; return (log10(a[1]) + a[2]) / log10(base) end
-function FastME.fromLog10(x: number): Value local m, e = fromLog10Raw(x); return {m, e} end
+function FastME.fromLog10(x: number): Value
+	if x ~= x then return {NAN, 0} end
+	if x == POS_INF then return {POS_INF, 0} end
+	if x == NEG_INF then return {0, 0} end
+	local e = floor(x)
+	local m = 10 ^ (x - e)
+	if m >= 10 then return {m * 0.1, e + 1} end
+	if m < 1 then return {m * 10, e - 1} end
+	return {m, e}
+end
 function FastME.exp10(x: number): Value local m, e = fromLog10Raw(x); return {m, e} end
 function FastME.exp2(x: number): Value local m, e = fromLog10Raw(x * LOG10_2); return {m, e} end
 function FastME.exp(x: number): Value local m, e = fromLog10Raw(x * LOG10_E); return {m, e} end
@@ -1733,7 +1930,7 @@ function FastME.minOf(values: {Value}): Value?
 		local vm, ve = v[1], v[2]
 		local take
 		if vm >= 0 and bm >= 0 and vm == vm and bm == bm and vm ~= POS_INF and bm ~= POS_INF then
-			if vm == 0 then take = false elseif bm == 0 then take = true elseif ve ~= be then take = ve < be else take = vm < bm end
+			if vm == 0 then take = bm > 0 elseif bm == 0 then take = false elseif ve ~= be then take = ve < be else take = vm < bm end
 		else take = compareRaw(vm, ve, bm, be) < 0 end
 		if take then best, bm, be = v, vm, ve end
 	end
@@ -1757,24 +1954,203 @@ function FastME.maxOf(values: {Value}): Value?
 end
 
 -- Zero-allocation output operations
-function FastME.set(out: Value, m: number, e: number): Value out[1], out[2] = m, e; out[1], out[2] = m, e; return out end
-function FastME.copyInto(out: Value, a: Value): Value out[1], out[2] = a[1], a[2]; out[1], out[2] = a[1], a[2]; return out end
-function FastME.addInto(out: Value, a: Value, b: Value): Value out[1], out[2] = addRaw(a[1], a[2], b[1], b[2]); out[1], out[2] = addRaw(a[1], a[2], b[1], b[2]); return out end
-function FastME.subInto(out: Value, a: Value, b: Value): Value out[1], out[2] = subRaw(a[1], a[2], b[1], b[2]); out[1], out[2] = subRaw(a[1], a[2], b[1], b[2]); return out end
-function FastME.mulInto(out: Value, a: Value, b: Value): Value out[1], out[2] = mulRaw(a[1], a[2], b[1], b[2]); out[1], out[2] = mulRaw(a[1], a[2], b[1], b[2]); return out end
-function FastME.divInto(out: Value, a: Value, b: Value): Value out[1], out[2] = divRaw(a[1], a[2], b[1], b[2]); out[1], out[2] = divRaw(a[1], a[2], b[1], b[2]); return out end
-function FastME.powInto(out: Value, a: Value, p: number): Value out[1], out[2] = powRaw(a[1], a[2], p); out[1], out[2] = powRaw(a[1], a[2], p); return out end
+-- Each kernel is evaluated exactly once. Besides being faster, this preserves the
+-- intended single-operation semantics for the mutable API.
+function FastME.set(out: Value, m: number, e: number): Value out[1], out[2] = m, e; return out end
+function FastME.copyInto(out: Value, a: Value): Value out[1], out[2] = a[1], a[2]; return out end
+function FastME.addInto(out: Value, a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if am ~= am or bm ~= bm then out[1], out[2] = NAN, 0; return out end
+	if am == POS_INF or am == NEG_INF then
+		if bm == -am then out[1], out[2] = NAN, 0; return out end
+		out[1], out[2] = am, 0; return out
+	end
+	if bm == POS_INF or bm == NEG_INF then out[1], out[2] = bm, 0; return out end
+	if am == 0 then out[1], out[2] = bm, be; return out end
+	if bm == 0 then out[1], out[2] = am, ae; return out end
+	if ae < be then am, bm, ae, be = bm, am, be, ae end
+	local d = ae - be
+	if d > 17 then out[1], out[2] = am, ae; return out end
+	local m = d == 0 and (am + bm) or (am + bm * POW10_NEG[d])
+	if m == 0 then out[1], out[2] = 0, 0; return out end
+	if (m >= 1 and m < 10) or (m <= -1 and m > -10) then out[1], out[2] = m, ae; return out end
+	if m >= 10 or m <= -10 then out[1], out[2] = m * 0.1, ae + 1; return out end
+	if m >= 0.1 or m <= -0.1 then out[1], out[2] = m * 10, ae - 1; return out end
+	local av = abs(m)
+	local shift = floor(log10(av))
+	if shift > 0 and shift <= 17 then m = m * POW10_NEG[shift]
+	elseif shift < 0 and shift >= -17 then m = m * POW10_POS[-shift]
+	else m = m / POW10_SCALE[shift + 309] end
+	ae = ae + shift
+	av = abs(m)
+	if av >= 10 then out[1], out[2] = m * 0.1, ae + 1; return out end
+	if av < 1 then out[1], out[2] = m * 10, ae - 1; return out end
+	out[1], out[2] = m, ae; return out
+end
+function FastME.subInto(out: Value, a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], -b[1], b[2]
+	if am ~= am or bm ~= bm then out[1], out[2] = NAN, 0; return out end
+	if am == POS_INF or am == NEG_INF then
+		if bm == -am then out[1], out[2] = NAN, 0; return out end
+		out[1], out[2] = am, 0; return out
+	end
+	if bm == POS_INF or bm == NEG_INF then out[1], out[2] = bm, 0; return out end
+	if am == 0 then out[1], out[2] = bm, be; return out end
+	if bm == 0 then out[1], out[2] = am, ae; return out end
+	if ae < be then am, bm, ae, be = bm, am, be, ae end
+	local d = ae - be
+	if d > 17 then out[1], out[2] = am, ae; return out end
+	local m = d == 0 and (am + bm) or (am + bm * POW10_NEG[d])
+	if m == 0 then out[1], out[2] = 0, 0; return out end
+	if (m >= 1 and m < 10) or (m <= -1 and m > -10) then out[1], out[2] = m, ae; return out end
+	if m >= 10 or m <= -10 then out[1], out[2] = m * 0.1, ae + 1; return out end
+	if m >= 0.1 or m <= -0.1 then out[1], out[2] = m * 10, ae - 1; return out end
+	local av = abs(m)
+	local shift = floor(log10(av))
+	if shift > 0 and shift <= 17 then m = m * POW10_NEG[shift]
+	elseif shift < 0 and shift >= -17 then m = m * POW10_POS[-shift]
+	else m = m / POW10_SCALE[shift + 309] end
+	ae = ae + shift
+	av = abs(m)
+	if av >= 10 then out[1], out[2] = m * 0.1, ae + 1; return out end
+	if av < 1 then out[1], out[2] = m * 10, ae - 1; return out end
+	out[1], out[2] = m, ae; return out
+end
+function FastME.mulInto(out: Value, a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	local m = am * bm
+	local magnitude = abs(m)
+	-- IEEE multiplication resolves NaN, infinity and zero-times-infinity.
+	if not (magnitude < POS_INF) then out[1], out[2] = m, 0; return out end
+	if m == 0 then out[1], out[2] = 0, 0; return out end
+	local e = ae + be
+	if magnitude >= 10 then out[1], out[2] = m * 0.1, e + 1; return out end
+	if magnitude < 1 then out[1], out[2] = m * 10, e - 1; return out end
+	out[1], out[2] = m, e; return out
+end
+function FastME.divInto(out: Value, a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if bm == 0 then
+		if am == 0 or am ~= am then out[1], out[2] = NAN, 0; return out end
+		out[1], out[2] = am > 0 and POS_INF or NEG_INF, 0; return out
+	end
+	local m = am / bm
+	local magnitude = abs(m)
+	if not (magnitude < POS_INF) then out[1], out[2] = m, 0; return out end
+	if m == 0 then out[1], out[2] = 0, 0; return out end
+	local e = ae - be
+	if magnitude < 1 then out[1], out[2] = m * 10, e - 1; return out end
+	if magnitude >= 10 then out[1], out[2] = m * 0.1, e + 1; return out end
+	out[1], out[2] = m, e; return out
+end
+function FastME.powInto(out: Value, a: Value, p: number): Value out[1], out[2] = powRaw(a[1], a[2], p); return out end
 
 -- In-place operations
-function FastME.iadd(a: Value, b: Value): Value a[1], a[2] = addRaw(a[1], a[2], b[1], b[2]); a[1], a[2] = addRaw(a[1], a[2], b[1], b[2]); return a end
-function FastME.isub(a: Value, b: Value): Value a[1], a[2] = subRaw(a[1], a[2], b[1], b[2]); a[1], a[2] = subRaw(a[1], a[2], b[1], b[2]); return a end
-function FastME.imul(a: Value, b: Value): Value a[1], a[2] = mulRaw(a[1], a[2], b[1], b[2]); a[1], a[2] = mulRaw(a[1], a[2], b[1], b[2]); return a end
-function FastME.idiv(a: Value, b: Value): Value a[1], a[2] = divRaw(a[1], a[2], b[1], b[2]); a[1], a[2] = divRaw(a[1], a[2], b[1], b[2]); return a end
-function FastME.isquare(a: Value): Value a[1], a[2] = squareRaw(a[1], a[2]); a[1], a[2] = squareRaw(a[1], a[2]); return a end
-function FastME.isqrt(a: Value): Value a[1], a[2] = sqrtRaw(a[1], a[2]); a[1], a[2] = sqrtRaw(a[1], a[2]); return a end
-function FastME.ipow(a: Value, p: number): Value a[1], a[2] = powRaw(a[1], a[2], p); a[1], a[2] = powRaw(a[1], a[2], p); return a end
-function FastME.ineg(a: Value): Value a[1] = -a[1]; a[1] = -a[1]; return a end
-function FastME.iabs(a: Value): Value a[1] = abs(a[1]); a[1] = abs(a[1]); return a end
+function FastME.iadd(a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if am ~= am or bm ~= bm then a[1], a[2] = NAN, 0; return a end
+	if am == POS_INF or am == NEG_INF then
+		if bm == -am then a[1], a[2] = NAN, 0; return a end
+		a[1], a[2] = am, 0; return a
+	end
+	if bm == POS_INF or bm == NEG_INF then a[1], a[2] = bm, 0; return a end
+	if am == 0 then a[1], a[2] = bm, be; return a end
+	if bm == 0 then a[1], a[2] = am, ae; return a end
+	if ae < be then am, bm, ae, be = bm, am, be, ae end
+	local d = ae - be
+	if d > 17 then a[1], a[2] = am, ae; return a end
+	local m = d == 0 and (am + bm) or (am + bm * POW10_NEG[d])
+	if m == 0 then a[1], a[2] = 0, 0; return a end
+	if (m >= 1 and m < 10) or (m <= -1 and m > -10) then a[1], a[2] = m, ae; return a end
+	if m >= 10 or m <= -10 then a[1], a[2] = m * 0.1, ae + 1; return a end
+	if m >= 0.1 or m <= -0.1 then a[1], a[2] = m * 10, ae - 1; return a end
+	local av = abs(m)
+	local shift = floor(log10(av))
+	if shift > 0 and shift <= 17 then m = m * POW10_NEG[shift]
+	elseif shift < 0 and shift >= -17 then m = m * POW10_POS[-shift]
+	else m = m / POW10_SCALE[shift + 309] end
+	ae = ae + shift
+	av = abs(m)
+	if av >= 10 then a[1], a[2] = m * 0.1, ae + 1; return a end
+	if av < 1 then a[1], a[2] = m * 10, ae - 1; return a end
+	a[1], a[2] = m, ae; return a
+end
+function FastME.isub(a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], -b[1], b[2]
+	if am ~= am or bm ~= bm then a[1], a[2] = NAN, 0; return a end
+	if am == POS_INF or am == NEG_INF then
+		if bm == -am then a[1], a[2] = NAN, 0; return a end
+		a[1], a[2] = am, 0; return a
+	end
+	if bm == POS_INF or bm == NEG_INF then a[1], a[2] = bm, 0; return a end
+	if am == 0 then a[1], a[2] = bm, be; return a end
+	if bm == 0 then a[1], a[2] = am, ae; return a end
+	if ae < be then am, bm, ae, be = bm, am, be, ae end
+	local d = ae - be
+	if d > 17 then a[1], a[2] = am, ae; return a end
+	local m = d == 0 and (am + bm) or (am + bm * POW10_NEG[d])
+	if m == 0 then a[1], a[2] = 0, 0; return a end
+	if (m >= 1 and m < 10) or (m <= -1 and m > -10) then a[1], a[2] = m, ae; return a end
+	if m >= 10 or m <= -10 then a[1], a[2] = m * 0.1, ae + 1; return a end
+	if m >= 0.1 or m <= -0.1 then a[1], a[2] = m * 10, ae - 1; return a end
+	local av = abs(m)
+	local shift = floor(log10(av))
+	if shift > 0 and shift <= 17 then m = m * POW10_NEG[shift]
+	elseif shift < 0 and shift >= -17 then m = m * POW10_POS[-shift]
+	else m = m / POW10_SCALE[shift + 309] end
+	ae = ae + shift
+	av = abs(m)
+	if av >= 10 then a[1], a[2] = m * 0.1, ae + 1; return a end
+	if av < 1 then a[1], a[2] = m * 10, ae - 1; return a end
+	a[1], a[2] = m, ae; return a
+end
+function FastME.imul(a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	local m = am * bm
+	local magnitude = abs(m)
+	-- IEEE multiplication resolves NaN, infinity and zero-times-infinity.
+	if not (magnitude < POS_INF) then a[1], a[2] = m, 0; return a end
+	if m == 0 then a[1], a[2] = 0, 0; return a end
+	local e = ae + be
+	if magnitude >= 10 then a[1], a[2] = m * 0.1, e + 1; return a end
+	if magnitude < 1 then a[1], a[2] = m * 10, e - 1; return a end
+	a[1], a[2] = m, e; return a
+end
+function FastME.idiv(a: Value, b: Value): Value
+	local am, ae, bm, be = a[1], a[2], b[1], b[2]
+	if bm == 0 then
+		if am == 0 or am ~= am then a[1], a[2] = NAN, 0; return a end
+		a[1], a[2] = am > 0 and POS_INF or NEG_INF, 0; return a
+	end
+	local m = am / bm
+	local magnitude = abs(m)
+	if not (magnitude < POS_INF) then a[1], a[2] = m, 0; return a end
+	if m == 0 then a[1], a[2] = 0, 0; return a end
+	local e = ae - be
+	if magnitude < 1 then a[1], a[2] = m * 10, e - 1; return a end
+	if magnitude >= 10 then a[1], a[2] = m * 0.1, e + 1; return a end
+	a[1], a[2] = m, e; return a
+end
+function FastME.isquare(a: Value): Value
+	local m, e = a[1], a[2]
+	local r = m * m
+	if not (r < POS_INF) then a[1], a[2] = r, 0; return a end
+	if r == 0 then a[1], a[2] = 0, 0; return a end
+	local re = e + e
+	if r >= 10 then a[1], a[2] = r * 0.1, re + 1; return a end
+	a[1], a[2] = r, re; return a
+end
+function FastME.isqrt(a: Value): Value
+	local m, e = a[1], a[2]
+	if m ~= m or m < 0 then a[1], a[2] = NAN, 0; return a end
+	if m == 0 then a[1], a[2] = 0, 0; return a end
+	if m == POS_INF then a[1], a[2] = POS_INF, 0; return a end
+	if e % 2 ~= 0 then m = m * 10; e = e - 1 end
+	a[1], a[2] = sqrt(m), e * 0.5; return a
+end
+function FastME.ipow(a: Value, p: number): Value a[1], a[2] = powRaw(a[1], a[2], p); return a end
+function FastME.ineg(a: Value): Value a[1] = -a[1]; return a end
+function FastME.iabs(a: Value): Value a[1] = abs(a[1]); return a end
 function FastME.ifma(a, b, c)
 	local m, e = mulRaw(a[1], a[2], b[1], b[2])
 	a[1], a[2] = addRaw(m, e, c[1], c[2])
@@ -2042,13 +2418,54 @@ function FastME.serialize(a: Value): string
 end
 
 function FastME.deserialize(s: string): Value
-	local p = strFind(s, "@", 1, true)
-	if not p then return {NAN, 0} end
+	local n = #s
+	if n < 3 then return {NAN, 0} end
+	local p = n - 1
+	while p > 1 and strByte(s, p) ~= 64 do p = p - 1 end
+	if p <= 1 then return {NAN, 0} end
+
 	local m = tonumber(strSub(s, 1, p - 1))
 	local e = tonumber(strSub(s, p + 1))
 	if m == nil or e == nil then return {NAN, 0} end
 	local rm, re = normalizeRaw(m, e)
 	return {rm, re}
 end
+
+function FastME.squareInto(out: Value, a: Value): Value
+	local m, e = a[1], a[2]
+	local r = m * m
+	if not (r < POS_INF) then out[1], out[2] = r, 0; return out end
+	if r == 0 then out[1], out[2] = 0, 0; return out end
+	local re = e + e
+	if r >= 10 then out[1], out[2] = r * 0.1, re + 1; return out end
+	out[1], out[2] = r, re; return out
+end
+
+function FastME.sqrtInto(out: Value, a: Value): Value
+	local m, e = a[1], a[2]
+	if m ~= m or m < 0 then out[1], out[2] = NAN, 0; return out end
+	if m == 0 then out[1], out[2] = 0, 0; return out end
+	if m == POS_INF then out[1], out[2] = POS_INF, 0; return out end
+	if e % 2 ~= 0 then m = m * 10; e = e - 1 end
+	out[1], out[2] = sqrt(m), e * 0.5; return out
+end
+
+FastME.normalizeRaw = normalizeRaw
+FastME.fromNumberRaw = fromNumberRaw
+FastME.fromStringRaw = fromStringRaw
+FastME.toNumberRaw = toNumberRaw
+FastME.addRaw = addRaw
+FastME.subRaw = subRaw
+FastME.mulRaw = mulRaw
+FastME.divRaw = divRaw
+FastME.scaleRaw = scaleRaw
+FastME.divScalarRaw = divScalarRaw
+FastME.recipRaw = recipRaw
+FastME.squareRaw = squareRaw
+FastME.sqrtRaw = sqrtRaw
+FastME.fromLog10Raw = fromLog10Raw
+FastME.powIntRaw = powIntRaw
+FastME.powRaw = powRaw
+FastME.compareRaw = compareRaw
 
 return FastME
