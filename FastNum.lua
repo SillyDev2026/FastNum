@@ -2,7 +2,7 @@
 --!native
 --!nocheck
 
--- FastME v2.9.1: direct scientific parsing plus v2.9.0 native kernels.
+-- FastME v2.9.5: v2.9.4 optimized parser + validated exponents, math edge cases and safe serialization.
 -- Value = {mantissa, exponent}; normalize externally constructed values first.
 -- Raw pair APIs return two numbers; they do not allocate result tables.
 -- Arithmetic expects normalized inputs and finite integer decimal exponents.
@@ -11,14 +11,15 @@
 local FastME = {}
 export type Value = {number}
 
-FastME.VERSION = "2.9.1"
-FastME.BUILD = "scientific-parser-20260928-a"
+FastME.VERSION = "2.9.5"
+FastME.BUILD = "math-validation-20261007"
 
 local abs = math.abs
 local floor = math.floor
 local sqrt = math.sqrt
 local log = math.log
 local log10 = math.log10
+local exp = math.exp
 local sin = math.sin
 local cos = math.cos
 local tan = math.tan
@@ -35,6 +36,7 @@ local strFormat = string.format
 local strByte = string.byte
 local strLower = string.lower
 local strUpper = string.upper
+local strMatch = string.match
 
 local NAN = 0 / 0
 local POS_INF = huge
@@ -54,6 +56,56 @@ local SQRT_HALF = 0.7071067811865476
 local CBRT10 = 2.154434690031884
 local CBRT100 = 4.641588833612779
 
+-- v2.9.2 logarithmic persistence codec.
+-- New finite values use signed ln(1 + |x|), which is monotonic and avoids the
+-- catastrophic precision loss of the legacy 1e18-offset layout.
+local LB_LEGACY_NEG_BASE = 1e18
+local LB_LEGACY_POS_BASE = 2e18
+local LB_LEGACY_ZERO = 4e18
+local LB_LEGACY_EXP_SCALE = 1e14
+local LB_LEGACY_MAN_SCALE = 1e13
+local LB_LEGACY_NEG_MIN = 9.5e17
+local LB_LEGACY_NEG_MAX = 1.05e18
+local LB_LEGACY_POS_MIN = 1.95e18
+local LB_LEGACY_POS_MAX = 2.05e18
+
+local function log1pPositive(x: number): number
+	local u = 1 + x
+	if u == 1 then return x end
+	-- Correct cancellation at small x; large x needs no ratio correction.
+	if x >= 0.5 then return log(u) end
+	return log(u) * (x / (u - 1))
+end
+
+local function expm1Positive(x: number): number
+	if x < 1e-4 then
+		return x * (1 + x * (0.5 + x * (0.16666666666666666 + x * (0.041666666666666664 + x * (0.008333333333333333 + x * (0.001388888888888889 + x * (0.0001984126984126984)))))))
+	end
+	return exp(x) - 1
+end
+
+local function isLegacyLB(val: number): boolean
+	return val == LB_LEGACY_ZERO
+		or (val >= LB_LEGACY_NEG_MIN and val <= LB_LEGACY_NEG_MAX)
+		or (val >= LB_LEGACY_POS_MIN and val <= LB_LEGACY_POS_MAX)
+end
+
+local function legacyLBDecode(val: number): number
+	if val == LB_LEGACY_ZERO then return 0 end
+
+	local negative = val < 1.5e18
+	local payload = negative and (LB_LEGACY_NEG_BASE - val) or (val - LB_LEGACY_POS_BASE)
+	local exponent = floor(payload / LB_LEGACY_EXP_SCALE)
+	if exponent < -324 or exponent > 308 then return NAN end
+
+	local manPart = payload - exponent * LB_LEGACY_EXP_SCALE
+	if manPart < 0 or manPart >= LB_LEGACY_EXP_SCALE then return NAN end
+
+	local man = 10 ^ (manPart / LB_LEGACY_MAN_SCALE)
+	local result = man * (10 ^ exponent)
+	return negative and -result or result
+end
+
 local POW10_POS = {
 	10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
 	1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17,
@@ -72,6 +124,7 @@ local function isSpaceByte(c: number): boolean
 end
 
 local function normalizeRaw(m: number, e: number): (number, number)
+	if e ~= e or e == POS_INF or e == NEG_INF or e % 1 ~= 0 then return NAN, 0 end
 	if m == 0 then return 0, 0 end
 	if m ~= m then return NAN, 0 end
 	if m == POS_INF or m == NEG_INF then return m, 0 end
@@ -168,6 +221,7 @@ local function boundedNumberRaw(x: number): (number, number)
 end
 
 local function toNumberRaw(m: number, e: number): number
+	if e ~= e or e == POS_INF or e == NEG_INF or e % 1 ~= 0 then return NAN end
 	if m == 0 then return 0 end
 	if m ~= m then return NAN end
 	if m == POS_INF or m == NEG_INF then return m end
@@ -212,11 +266,15 @@ local function manualStringRaw(s: string): (number, number)
 	local expValue = 0
 	local expDigits = 0
 	local expSignAllowed = true
+	local trailingSpace = false
 
 	while i <= n do
 		c = strByte(s, i)
 		if isSpaceByte(c) then
+			trailingSpace = true
 			i = i + 1
+		elseif trailingSpace then
+			return NAN, 0
 		elseif not expMode then
 			if c >= 48 and c <= 57 then
 				sawDigit = true
@@ -263,6 +321,7 @@ local function manualStringRaw(s: string): (number, number)
 
 	if not sawDigit then return NAN, 0 end
 	if expMode and expDigits == 0 then return NAN, 0 end
+	if expValue == POS_INF then return NAN, 0 end
 	if firstIndex == 0 then return 0, 0 end
 
 	local m = sig
@@ -283,116 +342,73 @@ local function finishScientificRaw(left: number, exponent: number): (number, num
 	return m, e + exponent
 end
 
--- The original parser remains the compatibility fallback.
--- A normalized scientific fast path runs before full-number conversion.
--- Normalized scientific values with large decimal exponents.
--- The <=15-significant-digit branch uses exact integer accumulation and one
--- binary64 division. Longer mantissas retain tonumber's rounding.
--- i is an e/E delimiter found by the caller; exponent digits are validated below.
-local function scientificStringRaw(s: string, i: number): (number?, number)
-	local n = #s
-	local cursor = i + 1
-	local c = strByte(s, cursor)
-	local negativeExponent = c == 45
-	if negativeExponent or c == 43 then cursor = cursor + 1 end
-	local exponent = 0
-	for position = cursor, n do
-		local digit = strByte(s, position) - 48
-		if digit < 0 or digit > 9 then return nil, 0 end
-		exponent = exponent * 10 + digit
-	end
-	if exponent >= 309 then
-		local p = 1
-		local first = strByte(s, p)
-		local negative = first == 45
-		if negative or first == 43 then p = p + 1; first = strByte(s, p) end
-		-- Canonical scientific mantissa: one nonzero digit, optional decimal fraction.
-		-- This excludes hexadecimal and nested exponent syntax before conversion.
-		if first >= 49 and first <= 57 then
-			local significand = first - 48
-			local digits = 1
-			p = p + 1
-			if p < i and strByte(s, p) == 46 then
-				p = p + 1
-				while p < i do
-					local digit = strByte(s, p) - 48
-					if digit < 0 or digit > 9 then break end
-					significand = significand * 10 + digit
-					digits = digits + 1
-					p = p + 1
-				end
-			end
-			if p == i then
-				local m
-				if digits == 1 then m = significand
-				elseif digits <= 15 then m = significand / POW10_POS[digits - 1]
-				else m = tonumber(strSub(s, 1, i - 1)); negative = false end
-				if negative then m = -m end
-				if negativeExponent then exponent = -exponent end
-				if m >= 10 or m <= -10 then m = m * 0.1; exponent = exponent + 1 end
-				return m, exponent
-			end
-		end
-	end
-	return nil, 0
+-- Fast canonical scientific grammar. Captures are validated in native string.match,
+-- avoiding one string.byte call per mantissa/exponent digit. Normal decimal strings
+-- still use Luau's optimized tonumber builtin without pattern matching.
+-- Only canonical *normalized* inputs use this shortcut; all other syntaxes fall
+-- back to the original parser to preserve public behavior.
+local function scientificStringRaw(s: string): (number?, number)
+	local mantissaText, exponentText = strMatch(s, "^([%+%-]?[1-9]%.?%d*)[eE]([%+%-]?%d+)$")
+	if mantissaText == nil then return nil, 0 end
+	local exponent = tonumber(exponentText)
+	if exponent == nil or exponent == POS_INF or exponent == NEG_INF or abs(exponent) < 309 then return nil, 0 end
+	local mantissa = tonumber(mantissaText)
+	if mantissa == nil or (mantissa > -1 and mantissa < 1) or mantissa >= 10 or mantissa <= -10 then return nil, 0 end
+	return mantissa, exponent
 end
 
-local function fromStringRaw(s: string): (number, number)
-	do
-		local n = #s
-		local candidate = 0
-		if n >= 6 then
-			local c = strByte(s, n - 4)
+-- Optional parsedKnown/parsedX pair is used only by public fromString. It
+-- eliminates the previous duplicate tonumber call for difficult short inputs.
+local function fromStringRaw(s: string, parsedX: number?, parsedKnown: boolean?): (number, number)
+	local n = #s
+	-- The common 4- and 5-digit huge exponent spellings are recognized cheaply.
+	-- Do not run a pattern matcher for every normal decimal input.
+	if n >= 10 then
+		local candidate = false
+		local c = strByte(s, n - 4)
+		if c == 101 or c == 69 then
+			candidate = true
+		elseif n >= 11 then
+			c = strByte(s, n - 5)
 			if c == 101 or c == 69 then
-				candidate = n - 4
-			else
-				c = strByte(s, n - 5)
-				candidate = (c == 101 or c == 69) and (n - 5) or 0
-				if candidate == 0 and (c == 45 or c == 43) and n >= 7 then
-					c = strByte(s, n - 6)
-					candidate = (c == 101 or c == 69) and (n - 6) or 0
-				end
+				candidate = true
+			elseif n >= 12 then
+				c = strByte(s, n - 6)
+				candidate = c == 101 or c == 69
 			end
 		end
-		if candidate > 0 then
-			local m, e = scientificStringRaw(s, candidate)
+		if candidate then
+			local m, e = scientificStringRaw(s)
 			if m ~= nil then return m, e end
 		end
 	end
-	local x = tonumber(s)
+
+	local x = parsedX
+	if not parsedKnown then x = tonumber(s) end
 	if x ~= nil then
 		if x ~= POS_INF and x ~= NEG_INF then
-			if x >= 1e-308 or x <= -1e-308 then
-				return fromNumberRaw(x)
-			end
+			if x >= 1e-308 or x <= -1e-308 then return fromNumberRaw(x) end
 		end
 
-		-- Byte scan handles overflow/underflow exponent detection directly.
-		-- Because tonumber already accepted the full syntax, we only need to
-		-- locate e/E and determine whether a zero result had any non-zero
-		-- mantissa digit before the exponent.
+		-- Handle canonical very large exponents even when the earlier positional
+		-- hint did not apply (short strings, many exponent digits or leading zeros).
+		if n >= 5 then
+			local m, e = scientificStringRaw(s)
+			if m ~= nil then return m, e end
+		end
+
+		-- The compatibility path handles noncanonical significands and whitespace,
+		-- including nonzero numbers underflowed by tonumber to zero.
 		local ePos
 		local hasNonZeroMantissa = x ~= 0
 		local scanIndex = 1
-		local scanLength = #s
-		while scanIndex <= scanLength do
+		while scanIndex <= n do
 			local byte = strByte(s, scanIndex)
-			if byte == 101 or byte == 69 then
-				ePos = scanIndex
-				break
-			end
-			if not hasNonZeroMantissa and byte >= 49 and byte <= 57 then
-				hasNonZeroMantissa = true
-			end
+			if byte == 101 or byte == 69 then ePos = scanIndex; break end
+			if not hasNonZeroMantissa and byte >= 49 and byte <= 57 then hasNonZeroMantissa = true end
 			scanIndex = scanIndex + 1
 		end
-		if x == 0 and not hasNonZeroMantissa then
-			return 0, 0
-		end
-
-		-- tonumber parsed the full syntax but overflowed/underflowed. Split only
-		-- after that successful syntax check so malformed strings cannot take
-		-- this fast path.
+		if x == 0 and not hasNonZeroMantissa then return 0, 0 end
 		if ePos then
 			local left = tonumber(strSub(s, 1, ePos - 1))
 			local exponent = tonumber(strSub(s, ePos + 1))
@@ -554,7 +570,8 @@ local function fromLog10Raw(x: number): (number, number)
 end
 
 local function powIntRaw(m: number, e: number, n: number): (number, number)
-	if n ~= n or n % 1 ~= 0 then return NAN, 0 end
+	-- Binary64 cannot resolve integer parity above 2^53; reject unbounded exponents.
+	if n ~= n or n == POS_INF or n == NEG_INF or n % 1 ~= 0 or abs(n) > 9007199254740991 then return NAN, 0 end
 	if n == 0 then return 1, 0 end
 	if n == 1 then return m, e end
 	if m == 0 then return n < 0 and POS_INF or 0, 0 end
@@ -637,12 +654,22 @@ end
 local function powRaw(m: number, e: number, p: number): (number, number)
 	if p ~= p then return NAN, 0 end
 	if p == 0 then return 1, 0 end
+	if p == POS_INF or p == NEG_INF then
+		if m == 1 and e == 0 then return 1, 0 end
+		if m == -1 and e == 0 then return NAN, 0 end
+		if m ~= m then return NAN, 0 end
+		local a = abs(m)
+		if a == 0 then return p > 0 and 0 or POS_INF, 0 end
+		local magnitude = (log10(a) + e) * (p > 0 and 1 or -1)
+		if magnitude == 0 then return NAN, 0 end
+		return magnitude > 0 and POS_INF or 0, 0
+	end
 	if p == 1 then return m, e end
 	if p == 2 then return squareRaw(m, e) end
 	if m == 0 then return p < 0 and POS_INF or 0, 0 end
 	if p % 1 == 0 and abs(p) <= 64 then return powIntRaw(m, e, p) end
 	if m < 0 then
-		if p % 1 ~= 0 then return NAN, 0 end
+		if p % 1 ~= 0 or abs(p) > 9007199254740991 then return NAN, 0 end
 		local rm, re = powRaw(-m, e, p)
 		if p % 2 ~= 0 then rm = -rm end
 		return rm, re
@@ -671,7 +698,12 @@ end
 
 local function compareAbsRaw(am: number, ae: number, bm: number, be: number): number
 	am, bm = abs(am), abs(bm)
-	if am == bm and ae == be then return 0 end
+	if am ~= am or bm ~= bm then return 0 end
+	if am == bm then
+		if am == POS_INF or am == 0 or ae == be then return 0 end
+	end
+	if am == POS_INF then return 1 end
+	if bm == POS_INF then return -1 end
 	if am == 0 then return -1 end
 	if bm == 0 then return 1 end
 	if ae ~= be then return ae < be and -1 or 1 end
@@ -752,189 +784,34 @@ function FastME.fromNumber(x: number): Value
 end
 
 function FastME.fromString(s: string): Value
-	local n = #s
-	if n == 0 then
-		return {NAN, 0}
-	end
-
-	local i = 1
-	local c = strByte(s, 1)
-	local sign = 1
-
-	if c == 45 then
-		sign = -1
-		i = 2
-	elseif c == 43 then
-		i = 2
-	end
-
-	if i > n then
-		return {NAN, 0}
-	end
-
-	local sig = 0
-	local sigCount = 0
-
-	local digitIndex = 0
-	local intDigits = 0
-	local firstIndex = 0
-
-	local sawDot = false
-	local exponentFound = false
-
-	while i <= n do
-		c = strByte(s, i)
-
-		if c >= 48 and c <= 57 then
-			local d = c - 48
-
-			digitIndex = digitIndex + 1
-			if not sawDot then
-				intDigits = intDigits + 1
+	-- Ordinary values use one builtin conversion, without allocations beyond
+	-- the returned {mantissa, exponent} pair. Difficult inputs reuse that parse.
+	if #s <= 18 then
+		local x = tonumber(s)
+		if x ~= nil and x ~= POS_INF and x ~= NEG_INF then
+			if x >= 1e-308 or x <= -1e-308 then
+				local m, e = fromNumberRaw(x)
+				return {m, e}
 			end
-
-			if firstIndex == 0 then
-				if d ~= 0 then
-					firstIndex = digitIndex
-					sig = d
-					sigCount = 1
-				end
-			elseif sigCount < 17 then
-				sig = sig * 10 + d
-				sigCount = sigCount + 1
-			end
-
-			i = i + 1
-
-		elseif c == 46 then
-			if sawDot then
-				return {NAN, 0}
-			end
-
-			sawDot = true
-			i = i + 1
-
-		elseif c == 101 or c == 69 then
-			if digitIndex == 0 then
-				return {NAN, 0}
-			end
-
-			exponentFound = true
-			i = i + 1
-			break
-
-		else
-			local x = tonumber(s)
-
-			if x == nil then
-				return {NAN, 0}
-			end
-
-			if x == 0 then
-				return {0, 0}
-			end
-
-			if x == POS_INF or x == NEG_INF then
-				return {x, 0}
-			end
-
-			local a = abs(x)
-			local e = floor(log10(a))
-			local m
-
-			if e >= 0 and e <= 17 then
-				m = x * POW10_NEG[e]
-			elseif e < 0 and e >= -17 then
-				m = x * POW10_POS[-e]
-			else
-				m = x / POW10_SCALE[e + 309]
-			end
-
-			local ma = abs(m)
-
-			if ma >= 10 then
-				return {m * 0.1, e + 1}
-			elseif ma < 1 then
-				return {m * 10, e - 1}
-			end
-
-			return {m, e}
 		end
+		local m, e = fromStringRaw(s, x, true)
+		return {m, e}
 	end
-
-	if digitIndex == 0 then
-		return {NAN, 0}
-	end
-
-	local expValue = 0
-
-	if exponentFound then
-		if i > n then
-			return {NAN, 0}
-		end
-
-		local expSign = 1
-		c = strByte(s, i)
-
-		if c == 45 then
-			expSign = -1
-			i = i + 1
-		elseif c == 43 then
-			i = i + 1
-		end
-
-		if i > n then
-			return {NAN, 0}
-		end
-
-		local expDigits = 0
-
-		while i <= n do
-			c = strByte(s, i)
-
-			if c < 48 or c > 57 then
-				return {NAN, 0}
-			end
-
-			expValue = expValue * 10 + (c - 48)
-			expDigits = expDigits + 1
-			i = i + 1
-		end
-
-		if expDigits == 0 then
-			return {NAN, 0}
-		end
-
-		expValue = expValue * expSign
-	end
-
-	if firstIndex == 0 then
-		return {0, 0}
-	end
-
-	local m
-
-	if sigCount == 1 then
-		m = sig * sign
-	else
-		m = sig * POW10_NEG[sigCount - 1] * sign
-	end
-
-	local e = intDigits - firstIndex + expValue
-
-	local ma = abs(m)
-
-	if ma >= 10 then
-		return {m * 0.1, e + 1}
-	elseif ma < 1 then
-		return {m * 10, e - 1}
-	end
-
+	local m, e = fromStringRaw(s)
 	return {m, e}
+end
+
+-- Allocation-free conversion for repeated parsing into a reused value table.
+function FastME.fromStringInto(out: Value, s: string): Value
+	local m, e = fromStringRaw(s)
+	out[1] = m
+	out[2] = e
+	return out
 end
 
 function FastME.toNumber(a: Value): number
 	local m, e = a[1], a[2]
+	if e ~= e or e == POS_INF or e == NEG_INF or e % 1 ~= 0 then return NAN end
 	if m == 0 then return 0 end
 	if m ~= m then return NAN end
 	if m == POS_INF or m == NEG_INF then return m end
@@ -952,6 +829,7 @@ end
 
 function FastME.normalize(a: Value): Value
 	local m, e = a[1], a[2]
+	if e ~= e or e == POS_INF or e == NEG_INF or e % 1 ~= 0 then return {NAN, 0} end
 	if m == 0 then return {0, 0} end
 	if m ~= m then return {NAN, 0} end
 	if m == POS_INF or m == NEG_INF then return {m, 0} end
@@ -1214,7 +1092,56 @@ function FastME.divNumber(a: Value, x: number): Value
 	local xm, xe = fromNumberRaw(x)
 	local rm, re = divRaw(m, e, xm, xe); return {rm, re}
 end
-function FastME.scale10(a: Value, amount: number): Value if a[1] == 0 then return {0, 0} end; return {a[1], a[2] + amount} end
+function FastME.scale10(a: Value, amount: number): Value
+	local m, e = a[1], a[2]
+	if amount ~= amount or amount == POS_INF or amount == NEG_INF or amount % 1 ~= 0 then return {NAN, 0} end
+	if m == 0 then return {0, 0} end
+	if m ~= m then return {NAN, 0} end
+	if m == POS_INF or m == NEG_INF then return {m, 0} end
+	local nextExponent = e + amount
+	if nextExponent ~= nextExponent or nextExponent == POS_INF or nextExponent == NEG_INF or nextExponent % 1 ~= 0 then return {NAN, 0} end
+	return {m, nextExponent}
+end
+
+-- Sort-preserving scalar codec used for compact persistent numeric values.
+-- New codes are roughly in [-709.8, 709.8] for all finite IEEE-754 doubles.
+function FastME.lbencode(val: number): number
+	if val ~= val then return NAN end
+	if val == POS_INF or val == NEG_INF then return val end
+	if val == 0 then return val end
+
+	local magnitude = val < 0 and -val or val
+	local encoded = log1pPositive(magnitude)
+	return val < 0 and -encoded or encoded
+end
+
+function FastME.lbdecode(val: number): number
+	if val ~= val then return NAN end
+	if val == POS_INF or val == NEG_INF then return val end
+	if val == 0 then return val end
+	if isLegacyLB(val) then return legacyLBDecode(val) end
+
+	local magnitude = val < 0 and -val or val
+	local decoded = expm1Positive(magnitude)
+	return val < 0 and -decoded or decoded
+end
+
+-- Compatibility spelling for projects that used the older typo.
+FastME.lbecode = FastME.lbencode
+
+-- Preserve the greatest decoded value and migrate legacy codes on the next write.
+function FastME.encodeData(val: number, oldData: number?): number
+	if oldData ~= nil then
+		local old = FastME.lbdecode(oldData)
+		if old == old then
+			if val ~= val or old >= val then
+				if isLegacyLB(oldData) then return FastME.lbencode(old) end
+				return oldData
+			end
+		end
+	end
+	return FastME.lbencode(val)
+end
 
 -- Comparison / predicates
 function FastME.compare(a: Value, b: Value): number
@@ -1260,7 +1187,7 @@ function FastME.lt(a: Value, b: Value): boolean
 end
 function FastME.lte(a: Value, b: Value): boolean
 	local am, ae, bm, be = a[1], a[2], b[1], b[2]
-	if am ~= am or bm ~= bm then return (0) <= 0 end
+	if am ~= am or bm ~= bm then return false end
 	if am == bm and ae == be then return (0) <= 0 end
 	if am == POS_INF then return (1) <= 0 end
 	if bm == POS_INF then return (-1) <= 0 end
@@ -1298,7 +1225,7 @@ function FastME.gt(a: Value, b: Value): boolean
 end
 function FastME.gte(a: Value, b: Value): boolean
 	local am, ae, bm, be = a[1], a[2], b[1], b[2]
-	if am ~= am or bm ~= bm then return (0) >= 0 end
+	if am ~= am or bm ~= bm then return false end
 	if am == bm and ae == be then return (0) >= 0 end
 	if am == POS_INF then return (1) >= 0 end
 	if bm == POS_INF then return (-1) >= 0 end
@@ -1317,9 +1244,9 @@ function FastME.gte(a: Value, b: Value): boolean
 end
 function FastME.isZero(a: Value): boolean return a[1] == 0 end
 function FastME.isOne(a: Value): boolean return a[1] == 1 and a[2] == 0 end
-function FastME.isNaN(a: Value): boolean return a[1] ~= a[1] or a[2] ~= a[2] end
+function FastME.isNaN(a: Value): boolean local e = a[2]; return a[1] ~= a[1] or e ~= e or e == POS_INF or e == NEG_INF or e % 1 ~= 0 end
 function FastME.isInfinity(a: Value): boolean return a[1] == POS_INF or a[1] == NEG_INF end
-function FastME.isFinite(a: Value): boolean return a[1] == a[1] and a[1] ~= POS_INF and a[1] ~= NEG_INF end
+function FastME.isFinite(a: Value): boolean local m, e = a[1], a[2]; return m == m and m ~= POS_INF and m ~= NEG_INF and e == e and e ~= POS_INF and e ~= NEG_INF and e % 1 == 0 end
 function FastME.isPositive(a: Value): boolean return a[1] > 0 end
 function FastME.isNegative(a: Value): boolean return a[1] < 0 end
 function FastME.sign(a: Value): number return a[1] > 0 and 1 or (a[1] < 0 and -1 or 0) end
@@ -1355,19 +1282,26 @@ function FastME.almostEqual(a: Value, b: Value, tolerance: number?): boolean
 end
 
 -- Min/max/clamp
-function FastME.min(a: Value, b: Value): Value return compareRaw(a[1], a[2], b[1], b[2]) <= 0 and {a[1], a[2]} or {b[1], b[2]} end
-function FastME.max(a: Value, b: Value): Value return compareRaw(a[1], a[2], b[1], b[2]) >= 0 and {a[1], a[2]} or {b[1], b[2]} end
+function FastME.min(a: Value, b: Value): Value
+	if a[1] ~= a[1] or b[1] ~= b[1] then return {NAN, 0} end
+	return compareRaw(a[1], a[2], b[1], b[2]) <= 0 and {a[1], a[2]} or {b[1], b[2]}
+end
+function FastME.max(a: Value, b: Value): Value
+	if a[1] ~= a[1] or b[1] ~= b[1] then return {NAN, 0} end
+	return compareRaw(a[1], a[2], b[1], b[2]) >= 0 and {a[1], a[2]} or {b[1], b[2]}
+end
 function FastME.clamp(a: Value, lo: Value, hi: Value): Value
+	if a[1] ~= a[1] or lo[1] ~= lo[1] or hi[1] ~= hi[1] then return {NAN, 0} end
 	if compareRaw(a[1], a[2], lo[1], lo[2]) < 0 then return {lo[1], lo[2]} end
 	if compareRaw(a[1], a[2], hi[1], hi[2]) > 0 then return {hi[1], hi[2]} end
 	return {a[1], a[2]}
 end
 
 -- Logs / exponentials
-function FastME.log10(a: Value): number if a[1] <= 0 then return NAN end; return log10(a[1]) + a[2] end
-function FastME.ln(a: Value): number if a[1] <= 0 then return NAN end; return (log10(a[1]) + a[2]) * LN10 end
-function FastME.log2(a: Value): number if a[1] <= 0 then return NAN end; return (log10(a[1]) + a[2]) * LOG2_10 end
-function FastME.log(a: Value, base: number): number if a[1] <= 0 or base <= 0 or base == 1 then return NAN end; return (log10(a[1]) + a[2]) / log10(base) end
+function FastME.log10(a: Value): number if a[1] == 0 then return NEG_INF end; if a[1] < 0 then return NAN end; return log10(a[1]) + a[2] end
+function FastME.ln(a: Value): number if a[1] == 0 then return NEG_INF end; if a[1] < 0 then return NAN end; return (log10(a[1]) + a[2]) * LN10 end
+function FastME.log2(a: Value): number if a[1] == 0 then return NEG_INF end; if a[1] < 0 then return NAN end; return (log10(a[1]) + a[2]) * LOG2_10 end
+function FastME.log(a: Value, base: number): number if base ~= base or base <= 0 or base == 1 or a[1] < 0 then return NAN end; if a[1] == 0 then return base > 1 and NEG_INF or POS_INF end; return (log10(a[1]) + a[2]) / log10(base) end
 function FastME.fromLog10(x: number): Value
 	if x ~= x then return {NAN, 0} end
 	if x == POS_INF then return {POS_INF, 0} end
@@ -1679,58 +1613,173 @@ function FastME.ordersBetween(a: Value, b: Value): number
 	return (log10(b[1]) + b[2]) - (log10(a[1]) + a[2])
 end
 
--- Mod/remainder: preserve v2.7 arithmetic order while removing quotient helper hops.
+-- Modulo for a large decimal-exponent gap: do NOT construct the enormous quotient.
+-- This rare/slow path uses base-10 modular exponentiation of 15-digit decimal
+-- significands. Every intermediate integer stays below 2^53 (exact in f64).
+-- The input format is still an approximate 15-16-digit mantissa/exponent pair;
+-- this deliberately rounds each mantissa to 15 significant decimal digits.
+local MOD_DECIMAL_SCALE = 1e14
+local MAX_SAFE_INTEGER = 9007199254740991
+
+local function modularMultiply(a: number, b: number, modulus: number): number
+	-- Exact binary64 integer products while modulus <= floor(sqrt(2^53-1)).
+	-- Particularly important for game remainder operations with small integer divisors.
+	if modulus <= 94906265 then return (a * b) % modulus end
+	local result = 0
+	while b > 0 do
+		if b % 2 == 1 then result = (result + a) % modulus end
+		b = floor(b * 0.5)
+		if b > 0 then a = (a + a) % modulus end
+	end
+	return result
+end
+
+local function modularPower10(exponent: number, modulus: number): number
+	local value = 1 % modulus
+	local base = 10 % modulus
+	while exponent > 0 do
+		if exponent % 2 == 1 then value = modularMultiply(value, base, modulus) end
+		exponent = floor(exponent * 0.5)
+		if exponent > 0 then base = modularMultiply(base, base, modulus) end
+	end
+	return value
+end
+
+local function wideRemainderRaw(am: number, ae: number, bm: number, be: number, euclidean: boolean): (number, number)
+	local gap = ae - be
+	if gap > MAX_SAFE_INTEGER then return NAN, 0 end
+	-- Specialize small integer divisors: exact f64 modulo without a 15-digit
+	-- scaled divisor, avoiding dozens of slow double-and-add iterations.
+	if be >= 0 and be <= 7 and ae >= 14 then
+		local divisor = abs(bm) * (be == 0 and 1 or POW10_POS[be])
+		if divisor >= 1 and divisor <= 94906265 and divisor % 1 == 0 then
+			local digits = floor(abs(am) * MOD_DECIMAL_SCALE + 0.5)
+			local rem = modularMultiply(digits % divisor, modularPower10(ae - 14, divisor), divisor)
+			if rem == 0 then return 0, 0 end
+			if euclidean then
+				if (am < 0) ~= (bm < 0) then rem = divisor - rem end
+				if bm < 0 then rem = -rem end
+			elseif am < 0 then
+				rem = -rem
+			end
+			return normalizeRaw(rem, 0)
+		end
+	end
+	local a = floor(abs(am) * MOD_DECIMAL_SCALE + 0.5)
+	local b = floor(abs(bm) * MOD_DECIMAL_SCALE + 0.5)
+	if b == 0 then return NAN, 0 end
+	local rem = modularMultiply(a % b, modularPower10(gap, b), b)
+	if rem == 0 then return 0, 0 end
+	if euclidean then
+		if (am < 0) ~= (bm < 0) then rem = b - rem end
+		if bm < 0 then rem = -rem end
+	elseif am < 0 then
+		rem = -rem
+	end
+	return normalizeRaw(rem / MOD_DECIMAL_SCALE, be)
+end
+
+-- rem follows truncated quotient semantics; mod follows floor quotient semantics.
+-- Common small exponents preserve the existing lightweight native fast path.
 function FastME.rem(a: Value, b: Value): Value
 	local am, ae, bm, be = a[1], a[2], b[1], b[2]
-	local d = ae - be
-	if bm == 0 or d > 15 then return {NAN, 0} end
-	if d > 1 then
-		if am ~= am or bm ~= bm or am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return {NAN,0} end
-		if am == 0 then return {0,0} end
+	if am ~= am or bm ~= bm or bm == 0 then return {NAN, 0} end
+	if am == POS_INF or am == NEG_INF then return {NAN, 0} end
+	if bm == POS_INF or bm == NEG_INF then return {am, ae} end
+	if am == 0 then return {0, 0} end
+	local gap = ae - be
+	if gap ~= gap or gap == POS_INF or gap == NEG_INF then return {NAN, 0} end
+	if gap >= 13 then
+		local m, e = wideRemainderRaw(am, ae, bm, be, false)
+		return {m, e}
+	end
+	if gap < -17 then return {am, ae} end
+	-- Fast exact-integer path: converting normalized pairs may differ by 1 ULP,
+	-- causing a truncated floating quotient to miss exact multiples.
+	if gap > 1 and ae >= 0 and ae <= 14 and be >= 0 and be <= 14 then
+		local av = toNumberRaw(am, ae)
+		local bv = toNumberRaw(bm, be)
+		local aa = abs(av)
+		local ba = abs(bv)
+		if aa <= MAX_SAFE_INTEGER and ba <= MAX_SAFE_INTEGER and ba > 0 then
+			local ai = aa >= 4503599627370496 and aa or floor(aa + 0.5)
+			local bi = ba >= 4503599627370496 and ba or floor(ba + 0.5)
+			if bi > 0 and abs(aa - ai) <= aa * 5e-16 and abs(ba - bi) <= ba * 5e-16 then
+				local value = (am < 0 and -ai or ai) % (bm < 0 and -bi or bi)
+				-- Luau % uses floor quotient; rem needs truncated quotient instead.
+				if value ~= 0 and (am < 0) ~= (bm < 0) then
+					value = value - (bm < 0 and -bi or bi)
+				end
+				local m, e = normalizeRaw(value, 0)
+				return {m, e}
+			end
+		end
+	end
+	if gap > 1 then
 		local qm = am / bm
-		local qe = d
+		local qe = gap
 		if qm > -1 and qm < 1 then qm = qm * 10; qe = qe - 1
 		elseif qm >= 10 or qm <= -10 then qm = qm * 0.1; qe = qe + 1 end
 		local q = qe == 0 and qm or qm * POW10_POS[qe]
 		q = q < 0 and -floor(-q) or floor(q)
 		local im, ie = fromNumberRaw(q)
 		local pm, pe = mulRaw(bm, be, im, ie)
-		local m, e = subRaw(am, ae, pm, pe); return {m, e}
+		local m, e = subRaw(am, ae, pm, pe)
+		return {m, e}
 	end
-	if am ~= am or bm ~= bm or am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return {NAN, 0} end
-	if am == 0 then return {0, 0} end
-	if d < -17 then return {am, ae} end
-	local scale = d == 0 and 1 or (d > 0 and POW10_POS[d] or POW10_NEG[-d])
+	local scale = gap == 0 and 1 or (gap > 0 and POW10_POS[gap] or POW10_NEG[-gap])
 	local scaled = am * scale
 	local q = scaled / bm
 	q = q < 0 and -floor(-q) or floor(q)
 	local m, e = normalizeRaw(scaled - q * bm, be)
 	return {m, e}
 end
+
 function FastME.mod(a: Value, b: Value): Value
 	local am, ae, bm, be = a[1], a[2], b[1], b[2]
-	local d = ae - be
-	if bm == 0 or d > 15 then return {NAN, 0} end
-	if d > 1 then
-		if am ~= am or bm ~= bm or am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return {NAN,0} end
-		if am == 0 then return {0,0} end
+	if am ~= am or bm ~= bm or bm == 0 then return {NAN, 0} end
+	if am == POS_INF or am == NEG_INF then return {NAN, 0} end
+	if bm == POS_INF or bm == NEG_INF then return {NAN, 0} end
+	if am == 0 then return {0, 0} end
+	local gap = ae - be
+	if gap ~= gap or gap == POS_INF or gap == NEG_INF then return {NAN, 0} end
+	if gap >= 13 then
+		local m, e = wideRemainderRaw(am, ae, bm, be, true)
+		return {m, e}
+	end
+	if gap < -17 then
+		if (am > 0) == (bm > 0) then return {am, ae} end
+		local m, e = addRaw(am, ae, bm, be)
+		return {m, e}
+	end
+	if gap > 1 and ae >= 0 and ae <= 14 and be >= 0 and be <= 14 then
+		local av = toNumberRaw(am, ae)
+		local bv = toNumberRaw(bm, be)
+		local aa = abs(av)
+		local ba = abs(bv)
+		if aa <= MAX_SAFE_INTEGER and ba <= MAX_SAFE_INTEGER and ba > 0 then
+			local ai = aa >= 4503599627370496 and aa or floor(aa + 0.5)
+			local bi = ba >= 4503599627370496 and ba or floor(ba + 0.5)
+			if bi > 0 and abs(aa - ai) <= aa * 5e-16 and abs(ba - bi) <= ba * 5e-16 then
+				local value = (am < 0 and -ai or ai) % (bm < 0 and -bi or bi)
+				local m, e = normalizeRaw(value, 0)
+				return {m, e}
+			end
+		end
+	end
+	if gap > 1 then
 		local qm = am / bm
-		local qe = d
+		local qe = gap
 		if qm > -1 and qm < 1 then qm = qm * 10; qe = qe - 1
 		elseif qm >= 10 or qm <= -10 then qm = qm * 0.1; qe = qe + 1 end
 		local q = qe == 0 and qm or qm * POW10_POS[qe]
 		q = floor(q)
 		local im, ie = fromNumberRaw(q)
 		local pm, pe = mulRaw(bm, be, im, ie)
-		local m, e = subRaw(am, ae, pm, pe); return {m, e}
+		local m, e = subRaw(am, ae, pm, pe)
+		return {m, e}
 	end
-	if am ~= am or bm ~= bm or am == POS_INF or am == NEG_INF or bm == POS_INF or bm == NEG_INF then return {NAN, 0} end
-	if am == 0 then return {0, 0} end
-	if d < -17 then
-		if (am > 0) == (bm > 0) then return {am, ae} end
-		local m,e=addRaw(am,ae,bm,be); return {m,e}
-	end
-	local scale = d == 0 and 1 or (d > 0 and POW10_POS[d] or POW10_NEG[-d])
+	local scale = gap == 0 and 1 or (gap > 0 and POW10_POS[gap] or POW10_NEG[-gap])
 	local scaled = am * scale
 	local q = floor(scaled / bm)
 	local m, e = normalizeRaw(scaled - q * bm, be)
@@ -2410,6 +2459,10 @@ function FastME.fromFormattedString(s: string): Value
 end
 
 function FastME.serialize(a: Value): string
+	local m = a[1]
+	if m ~= m then return "nan@0" end
+	if m == POS_INF then return "inf@0" end
+	if m == NEG_INF then return "-inf@0" end
 	local e = a[2]
 	if e % 1 == 0 and e >= -2147483648 and e <= 2147483647 then
 		return strFormat("%.17g@%d", a[1], e)
@@ -2420,13 +2473,23 @@ end
 function FastME.deserialize(s: string): Value
 	local n = #s
 	if n < 3 then return {NAN, 0} end
+
+	-- Serialized values place @ immediately before the exponent. Scanning from
+	-- the end normally touches only the exponent bytes instead of the mantissa.
 	local p = n - 1
 	while p > 1 and strByte(s, p) ~= 64 do p = p - 1 end
 	if p <= 1 then return {NAN, 0} end
 
-	local m = tonumber(strSub(s, 1, p - 1))
-	local e = tonumber(strSub(s, p + 1))
-	if m == nil or e == nil then return {NAN, 0} end
+	local mText = strLower(strSub(s, 1, p - 1))
+	local exponentText = strSub(s, p + 1)
+	local e = tonumber(exponentText)
+	if e == nil or e ~= e or e == POS_INF or e == NEG_INF or e % 1 ~= 0 then return {NAN, 0} end
+	local m
+	if mText == "nan" or mText == "-nan" then return {NAN, 0} end
+	if mText == "inf" or mText == "+inf" or mText == "infinity" then m = POS_INF
+	elseif mText == "-inf" or mText == "-infinity" then m = NEG_INF
+	else m = tonumber(mText) end
+	if m == nil then return {NAN, 0} end
 	local rm, re = normalizeRaw(m, e)
 	return {rm, re}
 end
@@ -2450,6 +2513,7 @@ function FastME.sqrtInto(out: Value, a: Value): Value
 	out[1], out[2] = sqrt(m), e * 0.5; return out
 end
 
+-- Pair API: normalized mantissa/exponent arguments; no result tables allocated.
 FastME.normalizeRaw = normalizeRaw
 FastME.fromNumberRaw = fromNumberRaw
 FastME.fromStringRaw = fromStringRaw
