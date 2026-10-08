@@ -5,7 +5,7 @@
 **Current release:** `2.9.5` · **Module:** `FastNum.lua` · **Exported table:** `FastME`  
 **Build:** `math-validation-20261007` · **Runtime:** Roblox Luau
 
-[Source](FastNum.lua) · [Installation](#installation) · [Quick start](#quick-start) · [API reference](#api-reference) · [Limitations](#precision-and-limitations)
+[Source](FastNum.lua) · [Installation](#installation) · [Quick start](#quick-start) · [API overview](#construction-and-parsing) · [Limitations](#precision-and-limitations)
 
 ## Why FastNum?
 
