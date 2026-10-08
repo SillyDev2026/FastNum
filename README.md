@@ -1,201 +1,106 @@
-# FastME
+# FastNum (FastME)
 
-**FastME** is a high-performance large-number library for Roblox Luau.
+**A fast, compact, mantissa/exponent number library for Roblox Luau.** Build incremental games, simulators, and other number-heavy systems that need values beyond the normal IEEE-754 magnitude range without giving up familiar math APIs.
 
-It represents numbers as a compact normalized mantissa/exponent pair:
+**Current release:** `2.9.5` · **Module:** `FastNum.lua` · **Exported table:** `FastME`  
+**Build:** `math-validation-20261007` · **Runtime:** Roblox Luau
 
-```luau
-{mantissa, exponent}
-```
+[Source](FastNum.lua) · [Installation](#installation) · [Quick start](#quick-start) · [API reference](#api-reference) · [Limitations](#precision-and-limitations)
 
-For example:
+## Why FastNum?
 
-```text
-{1.25, 6}  ==  1.25e6  ==  1,250,000
-{9.5, 120} ==  9.5e120
-```
+- **Huge magnitudes:** normalized base-10 mantissa/exponent pairs represent values such as `1.25e10000` without converting the full value to a regular Luau number.
+- **Native-oriented math:** `--!native` / `--!optimize 2`, specialized common operations, and scalar hot paths.
+- **Multiple allocation models:** standard result values, reusable output tables, mutable operations, and raw two-number math.
+- **Parsing and formatting:** decimal/scientific input, supported game suffixes, scientific/engineering notation, and compact suffix output.
+- **Persistence helpers:** text pair serialization, an order-preserving scalar codec, and compatibility decoding for an earlier codec format.
 
-FastME is designed for games that need values far beyond normal floating-point display ranges while keeping arithmetic, comparisons, formatting, parsing, and common game-math operations fast.
+> FastNum is the GitHub repository and source filename. The table returned by `require` is named **FastME**; examples below use that name.
 
-> Current version: **2.8.0**  
-> Build: **slowpath-rebuild-20260924-a**
+## What's new in v2.9.5?
 
----
+The 2.9.5 release carries forward the optimized v2.9.4 string parser and the v2.9.2 codec changes, with additional math and input validation:
 
-## Highlights
+- Validates finite, integer decimal exponents in normalization and conversion pathways.
+- Keeps the optimized scientific-string parser and `fromStringInto` output-table API.
+- Improves arithmetic and comparison behavior around NaN, infinity, and invalid exponent inputs.
+- Includes large-exponent remainder/modulo handling (`rem` and `mod`), subject to finite mantissa precision.
+- Uses a signed logarithmic scalar encoding for `lbencode`/`lbdecode`, with legacy-code decoding and `encodeData` retention logic.
+- Retains `serialize`/`deserialize` for the **two-number FastME value format**, distinct from the scalar codec.
 
-- Native Luau-oriented implementation with `--!native` and `--!optimize 2`
-- Compact two-number representation
-- Fast construction from ordinary numbers and strings
-- `string.byte`-driven recovery path in `fromString`
-- Arithmetic, roots, powers, logarithms, comparisons, rounding, interpolation, percentages, means, trigonometry, combinatorics, and aggregates
-- Human-readable suffix formatting such as `K`, `M`, `B`, `Qa`, `Qi`, and generated higher suffixes
-- Scientific and engineering notation
-- Human-formatted parsing such as `"1.25Qa"`
-- Serialization / deserialization
-- Mutable/in-place and output-buffer APIs
-- Cached factorial and log-factorial tables for small/medium integer inputs
-- Special-value handling for zero, `NaN`, `Infinity`, and `-Infinity`
-
----
+**Documentation scope:** this README describes the functions exposed by the current `FastNum.lua`. It does not claim a universal speedup or proof of correctness for every possible input.
 
 ## Installation
 
-Create a `ModuleScript` named `FastME` and paste `FastME.luau` into it.
-
-Then require it:
-
-```luau
-local FastME = require(path.To.FastME)
-```
-
-For best performance, leave these directives at the top of the module:
+1. Open [`FastNum.lua`](FastNum.lua) and copy its contents.
+2. In Roblox Studio, create a **ModuleScript** named `FastME`, for example under `ReplicatedStorage`, and paste the source.
+3. Require the ModuleScript from a Script or LocalScript.
 
 ```luau
---!native
---!optimize 2
+local FastME = require(game.ReplicatedStorage.FastME)
+
+print(FastME.VERSION) -- 2.9.5
+print(FastME.BUILD) -- math-validation-20261007
 ```
 
----
+The source already declares `--!native` and `--!optimize 2`. Keep the directives at the top if you want Luau's native optimization paths when available.
 
-## Value Representation
-
-FastME values use:
+## Quick start
 
 ```luau
-export type Value = {number}
-```
-
-The first element is the mantissa and the second is the base-10 exponent.
-
-```luau
-local value = FastME.raw(1.2345, 100)
-
-print(value[1]) -- 1.2345
-print(value[2]) -- 100
-```
-
-Normalized finite non-zero values generally keep the mantissa in:
-
-```text
-1 <= |mantissa| < 10
-```
-
-Do not manually change the mantissa/exponent of a normalized value unless you intentionally want a raw representation.
-
----
-
-## Quick Start
-
-```luau
-local FastME = require(path.To.FastME)
+local FastME = require(game.ReplicatedStorage.FastME)
 
 local coins = FastME.fromNumber(1250)
 local reward = FastME.fromString("2.5e6")
-
 local total = FastME.add(coins, reward)
 
-print(FastME.toString(total))
-print(FastME.toSuffix(total))
-print(FastME.toScientific(total))
+print(FastME.toSuffix(total)) -- 2.50M (default precision)
+print(FastME.toScientific(total)) -- scientific notation
+print(FastME.gt(total, coins)) -- true
 ```
 
-Example output:
+### Representation
 
-```text
-2501250
-2.50M
-2.50e6
-```
-
----
-
-## Creating Values
-
-### `FastME.new(mantissa, exponent?)`
-
-Creates and normalizes a value.
+A FastME value is a two-element table:
 
 ```luau
-local x = FastME.new(125, 4)
--- approximately {1.25, 6}
+local value = FastME.new(125, 4)
+print(value[1], value[2]) -- approximately 1.25, 6
 ```
 
-### `FastME.raw(mantissa, exponent)`
+Its approximate mathematical value is `mantissa * 10^exponent`. Normalized nonzero finite values have `1 <= abs(mantissa) < 10`, and the exponent is a finite integer. Zero is represented as `{0, 0}`.
 
-Creates a value without normalization.
+**Use `new` or `normalize` for externally constructed values.** `raw` and the raw pair functions assume the caller understands their input representation.
+
+## Construction and parsing
+
+| API | Purpose |
+|---|---|
+| `new(m, e?)` | Construct and normalize a mantissa/exponent value |
+| `raw(m, e)` | Construct without normalization |
+| `zero()`, `one()`, `two()`, `ten()`, `pi()`, `e()` | Common constructors |
+| `fromNumber(x)` | Convert an ordinary Luau number |
+| `fromString(s)` | Parse numeric/scientific text |
+| `fromStringInto(out, s)` | Parse into an existing value table |
+| `fromFormattedString(s)` | Parse a recognized formatted suffix |
+| `toNumber(a)` | Convert back to an ordinary Luau number |
+| `normalize(a)`, `clone(a)`, `unpack(a)` | Normalize, clone, or extract pair elements |
 
 ```luau
-local x = FastME.raw(1.25, 6)
+local huge = FastME.fromString("1.25e10000")
+local decimal = FastME.fromString("-0.00025")
+local short = FastME.fromFormattedString("2.5Qa")
+
+local reusable = {0, 0}
+FastME.fromStringInto(reusable, "7.5e250")
+print(FastME.toScientific(reusable))
 ```
 
-### Constants
+`fromString` accepts ordinary decimal and scientific numeric input; for examples such as `"1.5K"` and `"2.5Qa"` use `fromFormattedString` instead. Unparseable numeric text produces a NaN value; check it with `isNaN` when input is untrusted.
 
-```luau
-FastME.zero()
-FastME.one()
-FastME.two()
-FastME.ten()
-FastME.pi()
-FastME.e()
-```
+Supported parsed suffixes include `K`, `M`, `B`, `T`, `Qa`, `Qi`, `Sx`, `Sp`, `Oc`, `No` and the built-in extended group through `Vg`. The **formatter can generate more suffixes than the suffix parser recognizes**; don't assume every generated suffix will parse back.
 
-### Conversion
-
-```luau
-local a = FastME.fromNumber(123456)
-local b = FastME.fromString("1.23456e5")
-
-local number = FastME.toNumber(a)
-local normalized = FastME.normalize({123.456, 3})
-
-local copy = FastME.clone(a)
-local mantissa, exponent = FastME.unpack(a)
-```
-
-`toNumber` follows normal IEEE-754 number limits. Extremely large FastME values can therefore become `math.huge`, and extremely small values can underflow when converted back to a normal Luau number.
-
----
-
-## Parsing
-
-### `FastME.fromString(string)`
-
-Parses ordinary and scientific numeric strings.
-
-```luau
-FastME.fromString("1250")
-FastME.fromString("-3.75")
-FastME.fromString("1.25e1000")
-FastME.fromString("4.2E-500")
-```
-
-The ordinary finite-number path uses `tonumber`. Overflow/underflow recovery uses a byte-oriented scan so extremely large scientific values can still be represented without depending on normal f64 range.
-
-### `FastME.fromFormattedString(string)`
-
-Parses common suffix notation.
-
-```luau
-FastME.fromFormattedString("1.5K")
-FastME.fromFormattedString("2.25M")
-FastME.fromFormattedString("7.1Qa")
-FastME.fromFormattedString("3.4Vg")
-```
-
-Recognized built-in parse suffixes include:
-
-```text
-K M B T
-Qa Qi Sx Sp Oc No
-Dc Ud Dd Td Qad Qid Sxd Spd Ocd Nod Vg
-```
-
-Common upper/lowercase spellings are supported.
-
----
-
-## Arithmetic
+## Arithmetic, roots and comparison
 
 ```luau
 local a = FastME.fromString("1e100")
@@ -206,775 +111,191 @@ local difference = FastME.sub(a, b)
 local product = FastME.mul(a, b)
 local quotient = FastME.div(a, b)
 
-local reciprocal = FastME.recip(a)
-
 local squared = FastME.square(a)
-local cubed = FastME.cube(a)
-
 local squareRoot = FastME.sqrt(a)
-local cubeRoot = FastME.cbrt(a)
+local power = FastME.powInt(b, 3)
+local shifted = FastME.scale10(a, 5)
 
-local p5 = FastME.powInt(a, 5)
-local power = FastME.pow(a, 2.5)
-
-local root = FastME.nthRoot(a, 3)
--- alias:
-local sameRoot = FastME.root(a, 3)
-
-local shifted = FastME.scale10(a, 25)
+print(FastME.toScientific(sum))
+print(FastME.gte(sum, a)) -- true
 ```
 
----
+For ordinary scalar operands, prefer `addNumber`, `subNumber`, `mulNumber`, or `divNumber` where convenient.
 
-## Scalar Arithmetic
+| Group | Functions |
+|---|---|
+| Arithmetic | `add`, `sub`, `mul`, `div`, `recip`, `square`, `cube` |
+| Roots / powers | `sqrt`, `cbrt`, `powInt`, `pow`, `nthRoot`, `root` (alias), `scale10` |
+| Scalar arithmetic | `addNumber`, `subNumber`, `mulNumber`, `divNumber` |
+| Comparison | `compare`, `compareAbs`, `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `almostEqual` |
+| Predicates | `isZero`, `isOne`, `isNaN`, `isInfinity`, `isFinite`, `isPositive`, `isNegative` |
+| Sign / bounds | `sign`, `abs`, `neg`, `min`, `max`, `clamp` |
+| Remainder | `rem` (truncated quotient), `mod` (floor quotient) |
 
-When one operand is an ordinary Luau number:
+FastME's boolean ordering methods return `false` when a NaN operand makes an ordering invalid. The numeric `compare` function returns `0` for NaN cases; **do not interpret that as valid equality** without checking `isNaN`.
+
+## Reusable values and raw-pair operations
+
+Standard arithmetic (`add`, `mul`, etc.) returns a new value table. For hot code, reuse an output table or mutate an existing value intentionally.
 
 ```luau
-local a = FastME.fromString("1e50")
+local a = FastME.fromNumber(100)
+local b = FastME.fromNumber(25)
 
-FastME.addNumber(a, 25)
-FastME.subNumber(a, 25)
-FastME.mulNumber(a, 2)
-FastME.divNumber(a, 2)
+-- Write a result to an existing table.
+local out = {0, 0}
+FastME.addInto(out, a, b)
+
+-- Modify the first value directly.
+FastME.iadd(a, b)
+
+-- Return raw mantissa/exponent values without allocating a result table.
+local m, e = FastME.addRaw(1.25, 6, 2.5, 6)
+print(m, e)
 ```
 
----
+- **Output table:** `set`, `copyInto`, `fromStringInto`, `addInto`, `subInto`, `mulInto`, `divInto`, `powInto`, `squareInto`, `sqrtInto`.
+- **In-place:** `iadd`, `isub`, `imul`, `idiv`, `isquare`, `isqrt`, `ipow`, `ineg`, `iabs`, `ifma`.
+- **Raw pairs:** `normalizeRaw`, `fromNumberRaw`, `fromStringRaw`, `toNumberRaw`, `addRaw`, `subRaw`, `mulRaw`, `divRaw`, `scaleRaw`, `divScalarRaw`, `recipRaw`, `squareRaw`, `sqrtRaw`, `fromLog10Raw`, `powIntRaw`, `powRaw`, `compareRaw`.
 
-## Comparison and Predicates
-
-```luau
-FastME.compare(a, b)
-FastME.compareAbs(a, b)
-
-FastME.eq(a, b)
-FastME.neq(a, b)
-
-FastME.lt(a, b)
-FastME.lte(a, b)
-FastME.gt(a, b)
-FastME.gte(a, b)
-
-FastME.isZero(a)
-FastME.isOne(a)
-FastME.isNaN(a)
-FastME.isInfinity(a)
-FastME.isFinite(a)
-FastME.isPositive(a)
-FastME.isNegative(a)
-
-FastME.sign(a)
-FastME.abs(a)
-FastME.neg(a)
-
-FastME.almostEqual(a, b)
-FastME.almostEqual(a, b, 1e-10)
-```
-
-`compare` returns:
-
-```text
--1  a < b
- 0  a == b
- 1  a > b
-```
-
----
-
-## Min / Max / Clamp
-
-```luau
-FastME.min(a, b)
-FastME.max(a, b)
-FastME.clamp(value, minimum, maximum)
-```
-
----
-
-## Logarithms and Exponentials
-
-```luau
-FastME.log10(a)
-FastME.ln(a)
-FastME.log2(a)
-FastME.log(a, 5)
-
-FastME.fromLog10(1000)
-FastME.exp10(1000)
-FastME.exp2(100)
-FastME.exp(100)
-```
-
-The logarithm functions return normal Luau numbers representing the logarithm, while the exponential constructors return FastME values.
-
----
-
-## Rounding
-
-```luau
-FastME.trunc(a)
-FastME.floor(a)
-FastME.ceil(a)
-FastME.round(a)
-FastME.frac(a)
-
-FastME.roundSignificant(a, 6)
-```
-
----
-
-## Distance and Interpolation
-
-```luau
-FastME.distance(a, b)
-FastME.absDelta(a, b)
-
-FastME.lerp(a, b, 0.5)
-FastME.inverseLerp(a, b, value)
-
-FastME.remap(
-	value,
-	oldMinimum,
-	oldMaximum,
-	newMinimum,
-	newMaximum
-)
-
-FastME.smoothstep(edge0, edge1, value)
-FastME.smootherstep(edge0, edge1, value)
-```
-
----
-
-## Means and Geometry
-
-```luau
-FastME.mean(a, b)
-FastME.geometricMean(a, b)
-FastME.harmonicMean(a, b)
-
-FastME.rms(a, b)
-FastME.hypot(a, b)
-
-FastME.midpoint(a, b)
-```
-
----
-
-## Percent and Growth
-
-```luau
-FastME.percentOf(a, 25)
-FastME.increasePercent(a, 10)
-FastME.decreasePercent(a, 10)
-
-local change = FastME.percentChange(oldValue, newValue)
-local orders = FastME.ordersBetween(a, b)
-```
-
----
-
-## Remainder and Modulo
-
-```luau
-local remainder = FastME.rem(a, b)
-local modulo = FastME.mod(a, b)
-```
-
-FastME uses dedicated close-exponent paths where the operation can be safely performed directly and falls back to normalized large-number arithmetic where needed.
-
----
-
-## Combinatorics
-
-```luau
-local f = FastME.factorial(100)
-local logF = FastME.log10Factorial(100)
-
-local permutations = FastME.permutation(100, 10)
-local combinations = FastME.combination(100, 10)
-
--- aliases
-local permutations2 = FastME.nPr(100, 10)
-local combinations2 = FastME.nCr(100, 10)
-```
-
-FastME caches factorial and base-10 log-factorial data through `256`, making common combinatoric calls significantly cheaper than rebuilding the product every time.
-
-For larger inputs, FastME switches to logarithmic/Stirling-style computation where appropriate.
-
----
-
-## Gamma and Beta
-
-```luau
-local logGamma = FastME.logGamma(5.5)
-local gamma = FastME.gamma(5.5)
-local beta = FastME.beta(2.5, 3.5)
-```
-
----
-
-## Trigonometry
-
-```luau
-FastME.sin(a)
-FastME.cos(a)
-FastME.tan(a)
-
-FastME.asin(a)
-FastME.acos(a)
-FastME.atan(a)
-
-FastME.rad(a)
-FastME.deg(a)
-```
-
-Trigonometric functions ultimately operate within normal floating-point trigonometric range, so values too large to convert meaningfully to a normal number may not produce useful trig results.
-
----
-
-## Aggregates
-
-```luau
-local values = {
-	FastME.fromNumber(10),
-	FastME.fromNumber(20),
-	FastME.fromNumber(30),
-}
-
-local sum = FastME.sum(values)
-local product = FastME.product(values)
-local average = FastME.average(values)
-
-local minimum = FastME.minOf(values)
-local maximum = FastME.maxOf(values)
-```
-
-`minOf` and `maxOf` may return `nil` for an empty array.
-
----
+A raw pair function may return **two numbers** instead of a table. Supply normalized values to arithmetic raw functions unless the individual operation explicitly supports non-normalized input. An in-place call changes its first argument; use `clone` when the original must be preserved.
 
 ## Formatting
 
-FastME supports scientific, engineering, suffix, and general string formatting.
-
 ```luau
-local x = FastME.fromString("1.234567e15")
+local value = FastME.fromString("1.234567e15")
 
-print(FastME.toScientific(x))
-print(FastME.toEngineering(x))
-print(FastME.toSuffix(x))
-print(FastME.toString(x))
-print(FastME.format(x))
+print(FastME.toSuffix(value)) -- e.g. 1.23Qa
+print(FastME.toScientific(value)) -- scientific notation
+print(FastME.toEngineering(value)) -- engineering notation
+print(FastME.toString(value)) -- general numeric representation
 ```
 
-`FastME.format` is an alias of `FastME.toSuffix`.
+`format` is an alias of `toSuffix`. `getSuffix(group)` retrieves a suffix by 10^3 group index; `formatExponent(exponent, precision)` formats a number such as an exponent with compact units.
 
-### Format Configuration
+### Format configuration
 
-```luau
-FastME.FormatConfig.Precision = 2
-FastME.FormatConfig.MaxPrecision = 8
-FastME.FormatConfig.EStart = 3000
-FastME.FormatConfig.ScientificStart = -6
-FastME.FormatConfig.TrimZeros = false
-```
-
-Defaults:
-
-| Setting | Default | Meaning |
+| Setting | v2.9.5 default | Meaning |
 |---|---:|---|
-| `Precision` | `2` | Default suffix precision |
-| `MaxPrecision` | `8` | Maximum precision used by suffix formatting |
-| `EStart` | `3000` | Exponent threshold for `E...` exponent formatting |
-| `ScientificStart` | `-6` | Lower exponent boundary used by suffix formatting |
-| `TrimZeros` | `false` | Remove trailing decimal zeroes when enabled |
-
-Example:
+| `Precision` | `2` | Default suffix digits after decimal |
+| `MaxPrecision` | `8` | Maximum digits accepted by suffix formatting |
+| `EStart` | `3000` | Suffix formatter switches to compact `E`-exponent style |
+| `ScientificStart` | `-6` | Lower boundary for suffix formatting |
+| `TrimZeros` | `false` | Trim trailing zeros in formatted output |
 
 ```luau
-FastME.FormatConfig.TrimZeros = true
 FastME.FormatConfig.Precision = 3
+FastME.FormatConfig.TrimZeros = true
 
-local x = FastME.fromString("1.2e12")
-
-print(FastME.toSuffix(x))
--- 1.2T
+local value = FastME.fromString("1.2e12")
+print(FastME.toSuffix(value)) -- 1.2T
 ```
 
-### Built-in suffixes
+## Persistence and serialization
 
-FastME includes:
+**FastME values** and **ordinary scalar numbers** have different encoders. Choose based on the data you are storing.
 
-```text
-K, M, B, T,
-Qa, Qi, Sx, Sp, Oc, No,
-Dc, Ud, Dd, Td,
-Qad, Qid, Sxd, Spd, Ocd, Nod, Vg
-```
-
-It can generate additional suffix groups beyond the fixed table up to its internal suffix-generation limit.
-
-### Exponent formatting
+### 1. Serialize a mantissa/exponent FastME value
 
 ```luau
-FastME.formatExponent(1_234_567, 2)
+local balance = FastME.fromString("1.23456789e500")
+local saved = FastME.serialize(balance) -- mantissa@exponent
+local restored = FastME.deserialize(saved)
 ```
 
-Example style:
+`serialize` uses a text pair of the form `mantissa@exponent`, with up to 17 significant digits for the mantissa. `deserialize` validates the exponent and normalizes the result. This is useful when you want to store values far beyond ordinary number magnitude limits.
 
-```text
-1.23M
-```
-
-### Suffix lookup
+### 2. Encode an ordinary scalar number
 
 ```luau
-local suffix = FastME.getSuffix(5)
--- "Qa"
+local score = 125000
+local encoded = FastME.lbencode(score)
+local decoded = FastME.lbdecode(encoded)
+
+-- Keep the greater decoded score when replacing stored data.
+local nextEncoded = FastME.encodeData(130000, encoded)
 ```
 
----
+`lbencode` maps a finite ordinary number to a signed logarithmic scalar value. `lbdecode` reverses the mapping approximately; its decoder also recognizes the earlier large-offset encoding. `lbecode` remains an alias for `lbencode` for older callers. `encodeData(value, previousEncoded?)` keeps the larger decoded scalar value and can migrate an old code.
 
-## Serialization
+**Important:** the scalar codec is **not lossless** and should not be used as a replacement for `serialize` when saving very large FastME values, exact integer identifiers, currency requiring exact cents, or security-sensitive data. Save the complete pair with `serialize` when that is what you need.
 
-FastME provides a compact text representation for persistence/network payloads:
+## Additional mathematics
+
+The module also includes:
+
+| Category | Functions |
+|---|---|
+| Logs and exponentials | `log10`, `ln`, `log2`, `log`, `fromLog10`, `exp10`, `exp2`, `exp` |
+| Rounding | `trunc`, `floor`, `ceil`, `round`, `frac`, `roundSignificant` |
+| Interpolation | `distance`, `absDelta` (alias), `lerp`, `inverseLerp`, `remap`, `smoothstep`, `smootherstep` |
+| Statistics / geometry | `mean`, `midpoint` (alias), `geometricMean`, `harmonicMean`, `rms`, `hypot` |
+| Percent and growth | `percentOf`, `increasePercent`, `decreasePercent`, `percentChange`, `ordersBetween` |
+| Combinatorics | `log10Factorial`, `factorial`, `permutation`, `combination`, `nPr` (alias), `nCr` (alias) |
+| Special functions | `logGamma`, `gamma`, `beta` |
+| Trigonometry | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `rad`, `deg` |
+| Aggregates | `sum`, `product`, `average`, `minOf`, `maxOf` |
+
+Some functions, especially trigonometry and ordinary-number-returning helpers, rely on IEEE-754 range or accuracy. See [limitations](#precision-and-limitations).
+
+## Example: incremental-game upgrade cost
 
 ```luau
-local value = FastME.fromString("1.23456789e100")
-
-local encoded = FastME.serialize(value)
-local decoded = FastME.deserialize(encoded)
-```
-
-Serialized form:
-
-```text
-mantissa@exponent
-```
-
-Example:
-
-```text
-1.23456789@100
-```
-
-`serialize` writes up to 17 significant digits for the mantissa so normal f64 precision can round-trip through the text representation.
-
----
-
-## Special Values
-
-FastME recognizes:
-
-```luau
-FastME.fromString("0")
-FastME.fromNumber(math.huge)
-FastME.fromNumber(-math.huge)
-FastME.fromNumber(0 / 0)
-```
-
-Formatting returns:
-
-```text
-0
-Infinity
--Infinity
-NaN
-```
-
-Use the predicate functions when branching on these states.
-
----
-
-## Performance
-
-FastME is intended for hot game code.
-
-The v2.x series has focused on:
-
-- direct normalized arithmetic
-- avoiding unnecessary API-to-API forwarding
-- Luau-native-friendly builtin calls
-- table-free or cache-backed hot paths where useful
-- specialized small integer powers
-- byte-based extreme-number parsing
-- factorial/combinatoric caches
-- aligned-mantissa interpolation and aggregate math
-- reduced formatting helper chains
-
-The supplied full API benchmark covers **137 public functions and aliases** at iteration counts from `10,000` to `1,000,000`.
-
-Performance varies with:
-
-- Roblox/Luau version
-- native code generation
-- input exponent distance
-- allocation vs in-place APIs
-- formatting precision
-- special-value branches
-- Studio vs live-server execution
-
-For meaningful comparisons, benchmark inside Roblox using the same inputs and iteration counts between versions.
-
----
-
-## Benchmarking
-
-Recommended setup:
-
-```luau
---!native
---!optimize 2
-```
-
-Always verify the loaded module before benchmarking:
-
-```luau
-print(FastME.VERSION)
-print(FastME.BUILD)
-```
-
-Expected for this build:
-
-```text
-2.8.0
-slowpath-rebuild-20260924-a
-```
-
-If the benchmark prints a different version, Studio is requiring a different ModuleScript or an older play/test session.
-
-Stop the current session completely before swapping benchmark builds.
-
----
-
-## Current v2.8.0 Build Note
-
-The current `slowpath-rebuild-20260924-a` source contains duplicated operation statements in several **in-place / output-buffer** functions.
-
-Affected code includes functions such as:
-
-```text
-addInto
-subInto
-mulInto
-divInto
-powInto
-
-iadd
-isub
-imul
-idiv
-isquare
-isqrt
-ipow
-ineg
-iabs
-```
-
-Some duplicate calls only waste work, but several in-place forms can change the result twice. For example, applying `ineg` twice restores the original sign, and applying `isquare` twice computes a fourth power.
-
-**Do not rely on these affected mutable APIs in this exact build until that duplication is patched.**
-
-The ordinary immutable arithmetic APIs such as `add`, `sub`, `mul`, `div`, `pow`, `sqrt`, formatting, parsing, and combinatorics are separate from that issue.
-
----
-
-## API Overview
-
-### Construction / conversion
-
-```text
-new
-raw
-zero
-one
-two
-ten
-pi
-e
-clone
-unpack
-fromNumber
-fromString
-toNumber
-normalize
-```
-
-### Arithmetic
-
-```text
-add
-sub
-mul
-div
-recip
-square
-sqrt
-cube
-cbrt
-powInt
-pow
-nthRoot
-root
-scale10
-```
-
-### Scalar arithmetic
-
-```text
-addNumber
-subNumber
-mulNumber
-divNumber
-```
-
-### Comparison / predicates
-
-```text
-compare
-compareAbs
-eq
-neq
-lt
-lte
-gt
-gte
-isZero
-isOne
-isNaN
-isInfinity
-isFinite
-isPositive
-isNegative
-sign
-abs
-neg
-almostEqual
-```
-
-### Min / max
-
-```text
-min
-max
-clamp
-```
-
-### Logs / exponentials
-
-```text
-log10
-ln
-log2
-log
-fromLog10
-exp10
-exp2
-exp
-```
-
-### Rounding
-
-```text
-trunc
-floor
-ceil
-round
-frac
-roundSignificant
-```
-
-### Distance / interpolation
-
-```text
-distance
-absDelta
-lerp
-inverseLerp
-remap
-smoothstep
-smootherstep
-```
-
-### Means / geometry
-
-```text
-mean
-geometricMean
-harmonicMean
-rms
-hypot
-midpoint
-```
-
-### Percent / growth
-
-```text
-percentOf
-increasePercent
-decreasePercent
-percentChange
-ordersBetween
-```
-
-### Remainder
-
-```text
-rem
-mod
-```
-
-### Combinatorics / special
-
-```text
-log10Factorial
-factorial
-permutation
-combination
-nPr
-nCr
-logGamma
-gamma
-beta
-```
-
-### Trigonometry
-
-```text
-sin
-cos
-tan
-asin
-acos
-atan
-rad
-deg
-```
-
-### Aggregates
-
-```text
-sum
-product
-average
-minOf
-maxOf
-```
-
-### Formatting / parsing
-
-```text
-toScientific
-toEngineering
-toSuffix
-toString
-format
-fromFormattedString
-getSuffix
-formatExponent
-serialize
-deserialize
-```
-
-### Mutable / output-buffer
-
-```text
-set
-copyInto
-addInto
-subInto
-mulInto
-divInto
-powInto
-
-iadd
-isub
-imul
-idiv
-isquare
-isqrt
-ipow
-ineg
-iabs
-ifma
-```
-
-See the v2.8.0 build note above before using the mutable arithmetic APIs in build `slowpath-rebuild-20260924-a`.
-
----
-
-## Example: Roblox Currency
-
-```luau
-local FastME = require(path.To.FastME)
-
-local coins = FastME.zero()
-
-local function addCoins(amount: number)
-	coins = FastME.addNumber(coins, amount)
-end
-
-addCoins(100)
-addCoins(2500)
-
-print(FastME.toSuffix(coins))
-```
-
----
-
-## Example: Huge Upgrade Cost
-
-```luau
-local FastME = require(path.To.FastME)
+local FastME = require(game.ReplicatedStorage.FastME)
 
 local baseCost = FastME.fromNumber(100)
-local growth = FastME.fromNumber(1.15)
+local multiplier = FastME.fromNumber(1.15)
 
-local function costAtLevel(level: number)
-	return FastME.mul(
-		baseCost,
-		FastME.powInt(growth, level)
-	)
+local function upgradeCost(level: number)
+    return FastME.mul(baseCost, FastME.powInt(multiplier, level))
 end
 
-local cost = costAtLevel(1000)
-
+local cost = upgradeCost(1000)
 print(FastME.toSuffix(cost))
-print(FastME.toScientific(cost))
 ```
 
----
+## Precision and limitations
 
-## Example: Save / Load
+FastME extends **magnitude**, not arbitrary numeric **precision**:
+
+- The mantissa is an IEEE-754 double, so it has roughly **15–17 significant decimal digits**. Tiny additions to much larger magnitudes may be rounded away.
+- The exponent is also stored in a double; exact integer granularity is limited to the IEEE-754 safe-integer range. Invalid, nonfinite and fractional exponents are rejected by key public validation/conversion paths.
+- `toNumber` can overflow to infinity or underflow to zero. Keep values in FastME form for huge/small arithmetic.
+- `rem`/`mod` use special paths for wide exponent gaps, but are still constrained by mantissa precision rather than providing arbitrary-precision modular arithmetic.
+- Display formatting rounds output. Do **not** parse display suffixes as an archival storage format.
+- NaN/infinity and undefined operations require explicit error handling in game logic.
+- Native compilation, execution speed and memory use depend on the current Roblox/Luau engine, input shapes and allocation patterns. No universal per-function performance result is claimed here.
+
+If your application needs exact decimal money, arbitrarily many integer digits, or cryptographic precision, use a library designed for those requirements.
+
+## Benchmarking and regression checks
+
+Run benchmarks **inside Roblox Studio** on the same machine, inputs and Luau settings, with warm-up and repeat runs. Compare like-for-like code paths (allocating `add` vs allocating `add`, or raw-pair `addRaw` vs `addRaw`). Verify the loaded module first:
 
 ```luau
-local encoded = FastME.serialize(playerCoins)
+local FastME = require(game.ReplicatedStorage.FastME)
+assert(FastME.VERSION == "2.9.5", "Wrong FastME version loaded")
 
--- store encoded...
+local x = FastME.fromString("1e1000")
+assert(FastME.isFinite(x), "Huge number parsing failed")
+assert(FastME.gt(FastME.addNumber(FastME.one(), 2), FastME.two()), "Arithmetic failed")
 
-local restored = FastME.deserialize(encoded)
+print("FastME", FastME.VERSION, FastME.BUILD)
 ```
+
+Recommended additional regression categories: ordinary and extreme string parsing, negative/zero cases, arithmetic identities, NaN/infinity propagation, remainders, scalar-codec round-trips, serialization round-trips, and in-place/output-table behavior. Benchmark results are not correctness proofs.
+
+## Migrating from older versions
+
+- **From v2.8.0:** replace the previous ModuleScript source. The v2.8.0 README included build-specific warnings about duplicated mutable operations; those notes described **that older build**, not the current source.
+- **From v2.9.1:** use the v2.9.5 `FastNum.lua` for the newer parsing, scalar codec, and validation paths. Test game-specific inputs and saved values before deploying.
+- **Stored scalar leaderboard values:** `lbdecode` includes compatibility handling for legacy large-offset encodings. Re-encoding in the new format is recommended after verifying decoded values.
+- **Serialized FastME pairs:** continue using `serialize`/`deserialize`; do not confuse them with `lbencode`/`lbdecode`.
+
+## Development
+
+Issues, regression reports, benchmark comparisons and reproducible test cases are welcome in this repository's [issue tracker](https://github.com/SillyDev2026/FastNum/issues). When reporting a math bug, include the exact input, expected and observed values, module version/build, and whether the test ran in Roblox Studio or another Lua runtime.
 
 ---
 
-## Design Goal
-
-FastME is optimized for the common large-number workload in Roblox:
-
-1. Keep the representation tiny.
-2. Keep ordinary arithmetic predictable.
-3. Avoid converting huge values back into regular f64 numbers unless necessary.
-4. Specialize hot paths that show up in real benchmarks.
-5. Preserve numeric behavior when an optimization is not demonstrably safe.
-6. Prefer Roblox Luau measurements over generic Lua benchmark assumptions.
-
----
-
-## Version
-
-```text
-FastME 2.8.0
-Build: slowpath-rebuild-20260924-a
-```
+**FastNum v2.9.5 — optimized Luau, explicit numerical trade-offs, and a complete public API.**
