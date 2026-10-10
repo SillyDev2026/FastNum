@@ -1,8 +1,20 @@
 # FastNum (FastME)
 
+## v2.9.6 maintenance: parser and Luau analyzer
+
+- `fromStringInto(out, text)` now uses the same one-`tonumber` fast path as `fromString` for inputs up to 18 bytes. It still writes into the supplied two-element destination table, without allocating a new result.
+- Normal decimal, scientific, exceptional and overflow/underflow inputs retain the existing fallback parser semantics.
+- Replaced `--!nocheck` with `--!nonstrict` so Studio Script Analysis is no longer completely disabled for the main module. **This is not a claim of a clean strict typecheck.**
+- Persistent `lbencode`/`lbdecode` formats and mathematical algorithms are unchanged.
+
+Run `tests/FastNumParserRegression.server.lua` under Roblox Studio, with the main module named `FastNum` beside it. Check analyzer diagnostics and benchmark `fromStringInto` on representative short/large exponent workloads before merging.
+
+---
+
+
 **A fast, compact, mantissa/exponent number library for Roblox Luau.** Build incremental games, simulators, and other number-heavy systems that need values beyond the normal IEEE-754 magnitude range without giving up familiar math APIs.
 
-**Current release:** `2.9.5` · **Module:** `FastNum.lua` · **Exported table:** `FastME`  
+**Current release:** `2.9.6` · **Module:** `FastNum.lua` · **Exported table:** `FastME`  
 **Build:** `math-validation-20261007` · **Runtime:** Roblox Luau
 
 [Source](FastNum.lua) · [Installation](#installation) · [Quick start](#quick-start) · [API overview](#construction-and-parsing) · [Limitations](#precision-and-limitations)
@@ -17,9 +29,9 @@
 
 > FastNum is the GitHub repository and source filename. The table returned by `require` is named **FastME**; examples below use that name.
 
-## What's new in v2.9.5?
+## What's new in v2.9.6?
 
-The 2.9.5 release carries forward the optimized v2.9.4 string parser and the v2.9.2 codec changes, with additional math and input validation:
+The 2.9.6 release carries forward the optimized v2.9.4 string parser and the v2.9.2 codec changes, with additional math and input validation:
 
 - Validates finite, integer decimal exponents in normalization and conversion pathways.
 - Keeps the optimized scientific-string parser and `fromStringInto` output-table API.
@@ -39,7 +51,7 @@ The 2.9.5 release carries forward the optimized v2.9.4 string parser and the v2.
 ```luau
 local FastME = require(game.ReplicatedStorage.FastME)
 
-print(FastME.VERSION) -- 2.9.5
+print(FastME.VERSION) -- 2.9.6
 print(FastME.BUILD) -- math-validation-20261007
 ```
 
@@ -175,7 +187,7 @@ print(FastME.toString(value)) -- general numeric representation
 
 ### Format configuration
 
-| Setting | v2.9.5 default | Meaning |
+| Setting | v2.9.6 default | Meaning |
 |---|---:|---|
 | `Precision` | `2` | Default suffix digits after decimal |
 | `MaxPrecision` | `8` | Maximum digits accepted by suffix formatting |
@@ -274,7 +286,7 @@ Run benchmarks **inside Roblox Studio** on the same machine, inputs and Luau set
 
 ```luau
 local FastME = require(game.ReplicatedStorage.FastME)
-assert(FastME.VERSION == "2.9.5", "Wrong FastME version loaded")
+assert(FastME.VERSION == "2.9.6", "Wrong FastME version loaded")
 
 local x = FastME.fromString("1e1000")
 assert(FastME.isFinite(x), "Huge number parsing failed")
@@ -288,7 +300,7 @@ Recommended additional regression categories: ordinary and extreme string parsin
 ## Migrating from older versions
 
 - **From v2.8.0:** replace the previous ModuleScript source. The v2.8.0 README included build-specific warnings about duplicated mutable operations; those notes described **that older build**, not the current source.
-- **From v2.9.1:** use the v2.9.5 `FastNum.lua` for the newer parsing, scalar codec, and validation paths. Test game-specific inputs and saved values before deploying.
+- **From v2.9.1:** use the v2.9.6 `FastNum.lua` for the newer parsing, scalar codec, and validation paths. Test game-specific inputs and saved values before deploying.
 - **Stored scalar leaderboard values:** `lbdecode` includes compatibility handling for legacy large-offset encodings. Re-encoding in the new format is recommended after verifying decoded values.
 - **Serialized FastME pairs:** continue using `serialize`/`deserialize`; do not confuse them with `lbencode`/`lbdecode`.
 
@@ -298,4 +310,4 @@ Issues, regression reports, benchmark comparisons and reproducible test cases ar
 
 ---
 
-**FastNum v2.9.5 — optimized Luau, explicit numerical trade-offs, and a complete public API.**
+**FastNum v2.9.6 — optimized Luau, explicit numerical trade-offs, and a complete public API.**

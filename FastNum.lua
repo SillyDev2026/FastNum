@@ -1,6 +1,6 @@
 --!optimize 2
 --!native
---!nocheck
+--!nonstrict
 
 -- FastME v2.9.5: v2.9.4 optimized parser + validated exponents, math edge cases and safe serialization.
 -- Value = {mantissa, exponent}; normalize externally constructed values first.
@@ -11,8 +11,8 @@
 local FastME = {}
 export type Value = {number}
 
-FastME.VERSION = "2.9.5"
-FastME.BUILD = "math-validation-20261007"
+FastME.VERSION = "2.9.6"
+FastME.BUILD = "fromstringinto-audit-20261009"
 
 local abs = math.abs
 local floor = math.floor
@@ -803,10 +803,22 @@ end
 
 -- Allocation-free conversion for repeated parsing into a reused value table.
 function FastME.fromStringInto(out: Value, s: string): Value
-	local m, e = fromStringRaw(s)
-	out[1] = m
-	out[2] = e
-	return out
+    -- Match fromString's short-input fast path while reusing the destination.
+    local m, e
+    if #s <= 18 then
+        local parsed = tonumber(s)
+        if parsed ~= nil and parsed ~= POS_INF and parsed ~= NEG_INF
+            and (parsed >= 1e-308 or parsed <= -1e-308) then
+            m, e = fromNumberRaw(parsed)
+        else
+            m, e = fromStringRaw(s, parsed, true)
+        end
+    else
+        m, e = fromStringRaw(s)
+    end
+    out[1] = m
+    out[2] = e
+    return out
 end
 
 function FastME.toNumber(a: Value): number
