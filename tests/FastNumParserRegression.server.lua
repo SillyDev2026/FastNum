@@ -15,4 +15,14 @@ for _, input in ipairs(samples) do
 end
 local one = F.fromStringInto(out, "123.5")
 assert(one == out and F.toNumber(out) == 123.5)
+-- Invalid and oversized precision should not crash formatters or allocate huge format strings.
+local unit = F.one()
+for _, precision in {0/0, math.huge, -math.huge, 1000000000, -100} do
+    for _, formatter in {F.toScientific, F.toEngineering, F.toSuffix, F.toString} do
+        local ok, formatted = pcall(formatter, unit, precision)
+        assert(ok and type(formatted) == "string" and #formatted < 128, "Unsafe formatting precision: " .. tostring(precision))
+    end
+    local ok, value = pcall(F.roundSignificant, unit, precision)
+    assert(ok and F.isFinite(value), "Unsafe significant-digit precision: " .. tostring(precision))
+end
 print("FastNum v2.9.6 parser regression PASS")

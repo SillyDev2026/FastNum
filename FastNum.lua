@@ -1328,6 +1328,16 @@ function FastME.exp10(x: number): Value local m, e = fromLog10Raw(x); return {m,
 function FastME.exp2(x: number): Value local m, e = fromLog10Raw(x * LOG10_2); return {m, e} end
 function FastME.exp(x: number): Value local m, e = fromLog10Raw(x * LOG10_E); return {m, e} end
 
+-- Clamp precision before using table indexes or building string.format patterns.
+-- NaN and +/-infinity can otherwise produce invalid formats or runtime errors.
+local function safeDecimalPrecision(requested: number?, fallback: number, maximum: number): number
+	local p = if requested == nil or requested ~= requested then fallback else requested
+	if p ~= p then p = 0 end
+	if p <= 0 then return 0 end
+	if p >= maximum then return maximum end
+	return floor(p)
+end
+
 -- Rounding
 local function roundedIntegerRaw(m: number, e: number, mode: number): (number, number)
 	if m == 0 then return 0, 0 end
@@ -1377,9 +1387,8 @@ function FastME.frac(a: Value): Value
 	return {rm, re}
 end
 function FastME.roundSignificant(a: Value, digits: number?): Value
-	digits = floor(digits or 6)
+	digits = safeDecimalPrecision(digits, 6, 17)
 	if digits < 1 then return {0, 0} end
-	if digits > 17 then digits = 17 end
 	if a[1] == 0 or a[1] ~= a[1] or a[1] == POS_INF or a[1] == NEG_INF then return {a[1], a[2]} end
 	local scale = digits == 1 and 1 or POW10_POS[digits - 1]
 	local v = floor(abs(a[1]) * scale + 0.5) / scale
@@ -2328,7 +2337,7 @@ end
 FastME.formatExponent = compactScalar
 
 function FastME.toScientific(a: Value, precision: number?): string
-	precision = floor(precision or 2)
+	precision = safeDecimalPrecision(precision, 2, 17)
 	local m, e = a[1], a[2]
 	if m ~= m then return "NaN" end
 	if m == POS_INF then return "Infinity" end
@@ -2345,7 +2354,7 @@ function FastME.toScientific(a: Value, precision: number?): string
 	return r .. "e" .. tostring(e)
 end
 function FastME.toEngineering(a: Value, precision: number?): string
-	precision = floor(precision or 2)
+	precision = safeDecimalPrecision(precision, 2, 17)
 	local m, e = a[1], a[2]
 	if m ~= m then return "NaN" end
 	if m == POS_INF then return "Infinity" end
@@ -2365,8 +2374,8 @@ function FastME.toEngineering(a: Value, precision: number?): string
 	return r .. "e" .. tostring(ee)
 end
 function FastME.toSuffix(a: Value, precision: number?): string
-	precision = floor(precision or FastME.FormatConfig.Precision)
-	if precision < 0 then precision = 0 elseif precision > FastME.FormatConfig.MaxPrecision then precision = FastME.FormatConfig.MaxPrecision end
+	local maxPrecision = safeDecimalPrecision(FastME.FormatConfig.MaxPrecision, 8, 17)
+	precision = safeDecimalPrecision(precision, FastME.FormatConfig.Precision, maxPrecision)
 	local trim = FastME.FormatConfig.TrimZeros
 	local m, e = a[1], a[2]
 	if m ~= m then return "NaN" end
@@ -2416,7 +2425,7 @@ function FastME.toSuffix(a: Value, precision: number?): string
 end
 FastME.format = FastME.toSuffix
 function FastME.toString(a: Value, precision: number?): string
-	precision = floor(precision or 6)
+	precision = safeDecimalPrecision(precision, 6, 17)
 	local m,e=a[1],a[2]
 	if m ~= m then return "NaN" end
 	if m == POS_INF then return "Infinity" end
